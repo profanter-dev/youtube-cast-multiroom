@@ -32,12 +32,11 @@ interface CertPair {
 	forgeKey: forge.pki.rsa.PrivateKey;
 }
 
-function certHasSAN(certPem: string): boolean {
+function certHasRequiredExtensions(certPem: string): boolean {
 	try {
 		const c = forge.pki.certificateFromPem(certPem);
-		return c.extensions.some(
-			(e: { name?: string }) => e.name === "subjectAltName",
-		);
+		const names = c.extensions.map((e: { name?: string }) => e.name ?? "");
+		return names.includes("subjectAltName") && names.includes("keyUsage");
 	} catch {
 		return false;
 	}
@@ -59,12 +58,15 @@ function generateCert(): CertPair {
 	];
 	cert.setSubject(attrs);
 	cert.setIssuer(attrs);
-	// SubjectAltName is required by modern TLS clients (BoringSSL/Android enforces
-	// its presence in TLS 1.3 even without hostname verification)
-	cert.setExtensions([{
-		name: "subjectAltName",
-		altNames: [{ type: 2, value: `${DEVICE_NAME}.local` }],
-	}]);
+	cert.setExtensions([
+		{
+			name: "subjectAltName",
+			altNames: [{ type: 2, value: `${DEVICE_NAME}.local` }],
+		},
+		{ name: "basicConstraints", cA: false },
+		{ name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },
+		{ name: "extendedKeyUsage", serverAuth: true },
+	]);
 	cert.sign(keys.privateKey, forge.md.sha256.create());
 
 	const certPem = forge.pki.certificateToPem(cert);
@@ -84,8 +86,8 @@ function loadOrCreateCert(): CertPair {
 
 	if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
 		const certPem = fs.readFileSync(certFile, "utf8");
-		if (!certHasSAN(certPem)) {
-			console.log("Existing TLS cert lacks SubjectAltName — regenerating…");
+		if (!certHasRequiredExtensions(certPem)) {
+			console.log("Existing TLS cert lacks required extensions — regenerating…");
 			return generateCert();
 		}
 		console.log("Loaded existing TLS certificate from volume.");
@@ -652,10 +654,13 @@ async function main(): Promise<void> {
 		console.log(`castbridge listening on port ${CAST_PORT}`);
 	});
 
-	// Log TLS handshake failures (e.g. version or cipher mismatch with Cast SDK)
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	(server as any).server?.on("tlsClientError", (err: Error) => {
-		console.error("[tls] client error:", err.message);
+	const tlsServer = (server as any).server;
+	tlsServer?.on("tlsClientError", (err: Error, socket: { remoteAddress?: string }) => {
+		console.error(`[tls] handshake error from ${socket.remoteAddress ?? "?"}: ${err.message}`);
+	});
+	tlsServer?.on("secureConnection", (socket: { remoteAddress?: string; getProtocol?: () => string }) => {
+		console.log(`[tls] secure connection from ${socket.remoteAddress ?? "?"} (${socket.getProtocol?.() ?? "?"})`);
 	});
 
 	process.on("SIGTERM", () => {

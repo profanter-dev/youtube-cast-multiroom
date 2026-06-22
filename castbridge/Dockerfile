@@ -16,16 +16,15 @@ RUN curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
 WORKDIR /app
 
 # Install dependencies first (layer cache)
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --ignore-scripts \
-    && npm ci --ignore-scripts
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile --ignore-scripts
 
 # Copy source and compile
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npx tsc
+RUN yarn tsc
 
 # Remove devDependencies after build
-RUN npm prune --omit=dev
+RUN yarn install --frozen-lockfile --ignore-scripts --production
 
 ENTRYPOINT ["node", "dist/index.js"]

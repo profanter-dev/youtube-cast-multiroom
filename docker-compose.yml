@@ -1,17 +1,25 @@
 services:
-  castbridge:
+  musicbridge:
     build:
-      context: ./castbridge
+      context: ./musicbridge
       dockerfile: Dockerfile
-    container_name: castbridge
+    container_name: musicbridge
     restart: unless-stopped
-    network_mode: host
-    environment:
-      - DEVICE_NAME=${DEVICE_NAME:-Multiroom}
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
-      - ${DATA_DIR}/certs:/certs
-      - /etc/avahi/services:/etc/avahi/services
+      - ${DATA_DIR}/musicbridge:/data
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.music.rule=Host(`${MUSIC_HOST}`)"
+      - "traefik.http.routers.music.tls=true"
+      - "traefik.http.routers.music.tls.certresolver=porkbun"
+      - "traefik.http.routers.music.entrypoints=websecure"
+      - "traefik.http.routers.music.middlewares=music-auth"
+      # MUSIC_AUTH is an htpasswd user:hash pair (see README). Escape $ as $$ in .env.
+      - "traefik.http.middlewares.music-auth.basicauth.users=${MUSIC_AUTH}"
+      - "traefik.http.services.music.loadbalancer.server.port=8080"
 
   snapserver:
     build:
@@ -20,7 +28,7 @@ services:
     container_name: snapserver
     restart: unless-stopped
     depends_on:
-      - castbridge
+      - musicbridge
     ports:
       - "1704:1704"
       - "1705:1705"

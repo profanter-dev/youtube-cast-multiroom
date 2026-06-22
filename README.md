@@ -1,67 +1,119 @@
 # youtube-cast-multiroom
 
-Synchronized multiroom YouTube Music receiver built on a fake Chromecast device (castbridge) and Snapcast.
+Synchronized multiroom **YouTube Music** for homes whose speakers are Google TVs
+(or anything that can run the Snapcast client), built on **musicbridge** + **Snapcast**.
 
-## How it works
+## Why not just cast?
 
-1. **castbridge** advertises itself on your LAN as a Chromecast device named "Multiroom" via mDNS.
-2. When you cast from YouTube Music, castbridge receives the track, downloads audio via `yt-dlp`, transcodes it with `ffmpeg`, and writes raw PCM into a named pipe.
-3. **snapserver** reads from that pipe and streams the audio in perfect time-sync to every connected Snapcast client.
+YouTube Music can't cast to a self-built receiver. First-party Google apps require
+**Cast device authentication** backed by a certificate signed by Google's private
+Cast root CA — fused into licensed hardware and not obtainable by individuals. And
+Sony Bravia / Google TVs generally can't be added to Google Home **speaker groups**,
+so the native multiroom path is closed too.
+
+So instead of pretending to be a Cast target, **musicbridge** drives your YouTube
+Music *account* directly and feeds the audio into Snapcast:
+
+```
+Phone browser ──► music.<domain>  (musicbridge web UI, password-protected via Traefik)
+                        │  ytmusicapi  → your library / playlists / search
+                        │  yt-dlp      → audio stream for the chosen track
+                        │  ffmpeg      → raw PCM (48000:16:2)
+                        ▼
+                  /snapfifo  ──►  snapserver  ──►  Google TV #1 + #2  (Snapcast app, in sync)
+```
+
+The trade-off: you control playback from the **musicbridge web UI**, not the native
+YouTube Music app's Cast button. That's unavoidable — YouTube Music exposes no open
+"connect" protocol, so the only way in is through your account via `ytmusicapi`.
+
+## Components
+
+| Service | Role |
+|---|---|
+| `musicbridge` | Web remote + player. Searches your YTM account, streams audio into the Snapcast FIFO. |
+| `snapserver`  | Reads the FIFO and streams in sync to every Snapcast client. |
 
 ## Deploy
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/youtube-cast-multiroom
 cd youtube-cast-multiroom
-cp .env.example .env          # edit DEVICE_NAME if you want a different cast target name
+cp .env.example .env          # edit DATA_DIR, MUSIC_HOST, SNAPCAST_HOST, MUSIC_AUTH
+```
+
+### 1. Set the web-UI password (`MUSIC_AUTH`)
+
+The UI is exposed publicly via Traefik, so it's protected with HTTP basic auth.
+
+```bash
+htpasswd -nbB youruser 'yourpassword'
+```
+
+Put the result in `.env` as `MUSIC_AUTH`, **doubling every `$`** (compose treats a
+single `$` as a variable). Example: `$2y$05$abc…` becomes `$$2y$$05$$abc…`.
+
+### 2. Connect your YouTube Music account (one-time)
+
+`musicbridge` reads an `ytmusicapi` **browser auth** file. Create it once and drop it
+in the data dir:
+
+```bash
+pip install ytmusicapi          # on any machine
+ytmusicapi browser              # paste request headers from music.youtube.com — see below
+```
+
+To get the headers: open <https://music.youtube.com> logged in → DevTools (F12) →
+Network tab → click any `/youtubei/...` POST request → copy the **request headers**
+and paste them when prompted. This writes `browser.json`. Copy it to the host:
+
+```bash
+mkdir -p "$DATA_DIR/musicbridge"
+cp browser.json "$DATA_DIR/musicbridge/browser.json"
+```
+
+These credentials stay valid as long as your YouTube Music session does (~2 years,
+unless you log out). Without this file, musicbridge still works for **public search**,
+but the Library/Playlists tabs stay empty.
+
+### 3. Start
+
+```bash
 docker compose up -d --build
 ```
 
-> **Note:** castbridge runs with `network_mode: host` so mDNS multicast packets reach the LAN. The host running Docker must be on the same network segment as your phone for mDNS discovery to work.
+Open `https://<MUSIC_HOST>` on your phone, log in, search, and tap a track. Audio
+starts on every connected Snapcast client.
+
+## Install the Snapcast app on each Google TV
+
+1. Open the **Google Play Store** on the Google TV.
+2. Search for **Snapcast** and install the app by badaix.
+3. Open it, tap **+**, and enter the IP of the host running Docker.
+4. Connect — the TV now plays whatever musicbridge is streaming, in sync.
+
+Repeat on every TV. Per-room volume/mute is handled in the Snapcast app or the
+Snapweb UI at `http://<host>:1780`.
 
 ## Updating snapserver
 
-The snapserver version is pinned in `snapserver/Dockerfile` (`SNAPCAST_VERSION`). To update:
+Version is pinned in `snapserver/Dockerfile` (`SNAPCAST_VERSION`):
 
-1. Change `SNAPCAST_VERSION` to the new version number.
-2. Rebuild and restart: `docker compose build snapserver && docker compose up -d snapserver`
+```bash
+docker compose build snapserver && docker compose up -d snapserver
+```
 
-## Install Snapdroid on each Google TV
+To pick up a newer `yt-dlp` (YouTube changes break it periodically):
 
-1. Open the **Google Play Store** on your Google TV.
-2. Search for **Snapcast** and install the app by badaix.
-3. Open the app, tap the **+** button, and enter the IP address of the host running Docker.
-4. Press **Connect** — the TV will now receive synchronized audio whenever something is casting.
-
-Repeat on every TV you want in the multiroom group.
-
-## Cast music
-
-1. Open **YouTube Music** on your phone.
-2. Tap the **Cast** icon (top-right area of the player).
-3. Select **Multiroom** (or whatever you set `DEVICE_NAME` to).
-4. Music starts playing in sync on all connected TVs.
-
-To change volume per-room or mute individual TVs, use the Snapcast app on that TV or the Snapweb UI.
-
-## Snapweb volume control UI
-
-The Snapweb interface is available at `http://<your-host>:1780`. If you have Traefik with a wildcard cert, the included labels will also expose it over HTTPS on whatever hostname you configure in `docker-compose.yml`.
-
-From there you can:
-- Adjust volume for each individual Snapcast client
-- Mute or delay individual rooms
-- Group/ungroup clients
+```bash
+docker compose build musicbridge && docker compose up -d musicbridge
+```
 
 ## Environment variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `DEVICE_NAME` | `Multiroom` | Name shown in the YouTube Music cast picker |
-
-## Volumes
-
-| Volume | Purpose |
+| Variable | Description |
 |---|---|
-| `snapfifo` | Named pipe shared between castbridge and snapserver |
-| `castbridge-certs` | Persisted self-signed TLS cert for the Cast V2 server |
+| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/browser.json`). |
+| `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
+| `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
+| `MUSIC_AUTH` | `htpasswd` `user:hash` for the web UI (double every `$`). |

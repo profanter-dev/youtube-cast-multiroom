@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Multiroom</title>
+<style>
+  :root { --bg:#0f0f14; --card:#1b1b24; --accent:#ff4356; --txt:#f2f2f5; --dim:#9a9aa6; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--txt); padding-bottom:90px; }
+  header { position:sticky; top:0; background:var(--bg); padding:12px 14px 6px; z-index:5; }
+  h1 { font-size:18px; margin:0 0 10px; }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; }
+  .tabs button { flex:1; background:var(--card); color:var(--dim); border:0; padding:9px;
+                 border-radius:10px; font-size:14px; }
+  .tabs button.active { color:var(--txt); background:var(--accent); }
+  #search { width:100%; padding:11px 14px; border-radius:12px; border:0; font-size:15px;
+            background:var(--card); color:var(--txt); }
+  .list { padding:6px 10px; }
+  .row { display:flex; align-items:center; gap:10px; padding:8px; border-radius:10px; }
+  .row:active { background:var(--card); }
+  .row img { width:46px; height:46px; border-radius:6px; object-fit:cover; background:var(--card); flex:0 0 auto; }
+  .meta { flex:1; min-width:0; }
+  .meta .t { font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .meta .a { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .q { background:none; border:0; color:var(--dim); font-size:22px; padding:4px 8px; }
+  .hint { color:var(--dim); font-size:13px; padding:18px 14px; text-align:center; }
+  #player { position:fixed; left:0; right:0; bottom:0; background:var(--card);
+            padding:10px 14px calc(10px + env(safe-area-inset-bottom)); display:none; }
+  #player.show { display:block; }
+  .np { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .np img { width:42px; height:42px; border-radius:6px; object-fit:cover; }
+  .ctrls { display:flex; justify-content:center; align-items:center; gap:18px; }
+  .ctrls button { background:none; border:0; color:var(--txt); font-size:26px; }
+  .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎵 Multiroom</h1>
+  <div class="tabs">
+    <button data-tab="search" class="active">Search</button>
+    <button data-tab="library">Library</button>
+    <button data-tab="playlists">Playlists</button>
+  </div>
+  <input id="search" placeholder="Search YouTube Music…" autocomplete="off" />
+</header>
+
+<div id="list" class="list"></div>
+
+<div id="player">
+  <div class="np">
+    <img id="np-img" src="" alt="" />
+    <div class="meta"><div class="t" id="np-title">—</div><div class="a" id="np-artist"></div></div>
+  </div>
+  <div class="ctrls">
+    <button id="prev">⏮</button>
+    <button id="playpause" class="play">⏸</button>
+    <button id="next">⏭</button>
+    <button id="stop">⏹</button>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const listEl = $("#list");
+let tab = "search";
+
+async function api(path, opts) {
+  const r = await fetch("/api/" + path, opts);
+  if (!r.ok) throw new Error((await r.json()).error || r.status);
+  return r.json();
+}
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: body ? JSON.stringify(body) : null,
+});
+
+function render(tracks, emptyMsg) {
+  if (!tracks.length) { listEl.innerHTML = `<div class="hint">${emptyMsg}</div>`; return; }
+  listEl.innerHTML = "";
+  tracks.forEach(t => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <img src="${t.thumb || ""}" />
+      <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
+      <button class="q">＋</button>`;
+    row.querySelector("img").onclick = row.querySelector(".meta").onclick = () => post("play", t);
+    row.querySelector(".q").onclick = e => { e.stopPropagation(); post("queue", t); flash(e.target); };
+    listEl.appendChild(row);
+  });
+}
+const esc = s => (s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+function flash(b){ b.textContent="✓"; setTimeout(()=>b.textContent="＋",700); }
+
+// --- tabs ---
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  tab = b.dataset.tab;
+  $("#search").style.display = tab === "search" ? "block" : "none";
+  loadTab();
+});
+
+async function loadTab() {
+  listEl.innerHTML = `<div class="hint">Loading…</div>`;
+  try {
+    if (tab === "library") render(await api("library"), "Library is empty or needs account auth.");
+    else if (tab === "playlists") renderPlaylists(await api("playlists"));
+    else listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`;
+  } catch (e) { listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+}
+
+function renderPlaylists(pls) {
+  if (!pls.length) { listEl.innerHTML = `<div class="hint">No playlists (needs account auth).</div>`; return; }
+  listEl.innerHTML = "";
+  pls.forEach(p => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<img src="${p.thumb || ""}" /><div class="meta"><div class="t">${esc(p.title)}</div></div>`;
+    row.onclick = async () => {
+      listEl.innerHTML = `<div class="hint">Loading…</div>`;
+      const data = await api("playlist/" + p.playlistId);
+      render(data.tracks, "Empty playlist.");
+    };
+    listEl.appendChild(row);
+  });
+}
+
+// --- search (debounced) ---
+let timer;
+$("#search").addEventListener("input", e => {
+  clearTimeout(timer);
+  const q = e.target.value.trim();
+  if (!q) { listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
+  timer = setTimeout(async () => {
+    try { render(await api("search?q=" + encodeURIComponent(q)), "No results."); }
+    catch (err) { listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
+  }, 350);
+});
+
+// --- transport ---
+$("#prev").onclick = () => post("prev");
+$("#next").onclick = () => post("next");
+$("#stop").onclick = () => post("stop");
+$("#playpause").onclick = () => post(paused ? "resume" : "pause");
+
+let paused = false;
+async function poll() {
+  try {
+    const s = await api("status");
+    const p = $("#player");
+    if (s.current) {
+      p.classList.add("show");
+      $("#np-title").textContent = s.current.title;
+      $("#np-artist").textContent = s.current.artist || "";
+      $("#np-img").src = s.current.thumb || "";
+      paused = s.paused;
+      $("#playpause").textContent = paused ? "▶" : "⏸";
+    } else {
+      p.classList.remove("show");
+    }
+  } catch (e) {}
+  setTimeout(poll, 2000);
+}
+poll();
+loadTab();
+</script>
+</body>
+</html>

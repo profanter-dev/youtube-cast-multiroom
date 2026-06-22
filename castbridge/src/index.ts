@@ -249,10 +249,11 @@ function handleDeviceAuth(
 		? (rawData as unknown as Buffer)
 		: Buffer.from(rawData as string, "binary");
 
-	const nonce = parseDeviceAuthNonce(buf);
-	if (!nonce) {
-		console.warn("[deviceauth] could not extract sender_nonce");
-		return;
+	console.log("[deviceauth] raw hex:", buf.slice(0, 40).toString("hex"), "len:", buf.length);
+
+	const nonce = parseDeviceAuthNonce(buf) ?? Buffer.alloc(0);
+	if (!nonce.length) {
+		console.warn("[deviceauth] no sender_nonce found, proceeding without nonce");
 	}
 
 	const md = forge.md.sha256.create();
@@ -264,14 +265,15 @@ function handleDeviceAuth(
 		"binary",
 	);
 
-	// DeviceAuthMessage { response(2): DeviceAuthResponse { sig(1), cert(2), alg(4), nonce(5), hash(6) } }
-	const responsePb = pbLenDelim(2, Buffer.concat([
+	// DeviceAuthMessage { response(2): DeviceAuthResponse { sig(1), cert(2), alg(4), nonce(5)?, hash(6) } }
+	const responseFields = [
 		pbLenDelim(1, sig),
 		pbLenDelim(2, certDER),
 		pbVarintField(4, 1),       // signature_algorithm: RSASSA_PKCS1v15
-		pbLenDelim(5, nonce),
+		...(nonce.length ? [pbLenDelim(5, nonce)] : []),
 		pbVarintField(6, 2),       // hash_algorithm: SHA256
-	]));
+	];
+	const responsePb = pbLenDelim(2, Buffer.concat(responseFields));
 
 	const castMsg = buildCastBinaryMessage("receiver-0", sourceId, NS_DEVICEAUTH, responsePb);
 

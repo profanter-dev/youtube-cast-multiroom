@@ -65,7 +65,7 @@ function generateCert(): CertPair {
 		},
 		{ name: "basicConstraints", cA: false },
 		{ name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },
-		{ name: "extendedKeyUsage", serverAuth: true },
+		{ name: "extKeyUsage", serverAuth: true },
 	]);
 	cert.sign(keys.privateKey, forge.md.sha256.create());
 

@@ -4,7 +4,6 @@ import * as crypto from "crypto";
 import { EventEmitter } from "events";
 import { execSync, spawn, ChildProcess } from "child_process";
 import forge from "node-forge";
-import { Bonjour } from "bonjour-service";
 import { v4 as uuidv4 } from "uuid";
 
 const DEVICE_NAME = process.env["DEVICE_NAME"] ?? "Multiroom";
@@ -411,30 +410,39 @@ function handleMessage(
 // ---------------------------------------------------------------------------
 
 function advertiseMdns(): void {
-	const bonjour = new Bonjour();
 	const deviceId = crypto
 		.randomBytes(6)
 		.toString("hex")
 		.replace(/../g, (h) => h + ":")
 		.slice(0, -1);
 
-	bonjour.publish({
-		name: DEVICE_NAME,
-		type: "googlecast",
-		port: CAST_PORT,
-		txt: {
-			id: uuidv4().replace(/-/g, ""),
-			cd: deviceId,
-			rm: "",
-			ve: "05",
-			md: DEVICE_NAME,
-			ic: "/setup/icon.png",
-			fn: DEVICE_NAME,
-			ca: "4101",
-			st: "0",
-			bs: deviceId,
-			rs: "",
-		},
+	const id = uuidv4().replace(/-/g, "");
+
+	// avahi-publish -s talks to the host avahi-daemon via D-Bus, so it never
+	// tries to bind port 5353 itself and won't conflict with the host daemon.
+	const proc = spawn(
+		"avahi-publish",
+		[
+			"-s", DEVICE_NAME, "_googlecast._tcp", String(CAST_PORT),
+			`id=${id}`,
+			`cd=${deviceId}`,
+			`rm=`,
+			`ve=05`,
+			`md=${DEVICE_NAME}`,
+			`ic=/setup/icon.png`,
+			`fn=${DEVICE_NAME}`,
+			`ca=4101`,
+			`st=0`,
+			`bs=${deviceId}`,
+			`rs=`,
+		],
+		{ stdio: "inherit" },
+	);
+
+	proc.on("error", (err) => console.error("avahi-publish error:", err));
+	proc.on("exit", (code) => {
+		if (code !== 0 && code !== null)
+			console.error(`avahi-publish exited with code ${code}`);
 	});
 
 	console.log(

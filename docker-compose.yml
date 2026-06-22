@@ -11,6 +11,7 @@ services:
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ${DATA_DIR}/certs:/certs
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
 
   snapserver:
     build:

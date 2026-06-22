@@ -29,6 +29,7 @@ function ensureSnapfifo(): void {
 interface CertPair {
 	cert: string;
 	key: string;
+	forgeKey: forge.pki.rsa.PrivateKey;
 }
 
 function loadOrCreateCert(): CertPair {
@@ -37,9 +38,11 @@ function loadOrCreateCert(): CertPair {
 
 	if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
 		console.log("Loaded existing TLS certificate from volume.");
+		const keyPem = fs.readFileSync(keyFile, "utf8");
 		return {
 			cert: fs.readFileSync(certFile, "utf8"),
-			key: fs.readFileSync(keyFile, "utf8"),
+			key: keyPem,
+			forgeKey: forge.pki.privateKeyFromPem(keyPem) as forge.pki.rsa.PrivateKey,
 		};
 	}
 
@@ -70,7 +73,7 @@ function loadOrCreateCert(): CertPair {
 	fs.writeFileSync(keyFile, keyPem);
 	console.log("TLS certificate written to volume.");
 
-	return { cert: certPem, key: keyPem };
+	return { cert: certPem, key: keyPem, forgeKey: keys.privateKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +139,126 @@ function startPlayback(videoId: string): void {
 		if (code !== 0 && code !== null)
 			console.error(`ffmpeg exited with code ${code}`);
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Cast DeviceAuth — the sender sends a binary protobuf DeviceAuthChallenge
+// and the receiver must sign the nonce with its TLS private key.
+// Implemented with manual protobuf encode/decode to avoid extra dependencies.
+// ---------------------------------------------------------------------------
+
+const NS_DEVICEAUTH = "urn:x-cast:com.google.cast.tp.deviceauth";
+
+function pbVarint(n: number): Buffer {
+	const bytes: number[] = [];
+	do {
+		let b = n & 0x7f;
+		n >>>= 7;
+		if (n > 0) b |= 0x80;
+		bytes.push(b);
+	} while (n > 0);
+	return Buffer.from(bytes);
+}
+
+function pbLenDelim(fieldNum: number, data: Buffer): Buffer {
+	return Buffer.concat([pbVarint((fieldNum << 3) | 2), pbVarint(data.length), data]);
+}
+
+function pbVarintField(fieldNum: number, value: number): Buffer {
+	return Buffer.concat([pbVarint((fieldNum << 3) | 0), pbVarint(value)]);
+}
+
+function parseDeviceAuthNonce(msg: Buffer): Buffer | null {
+	// DeviceAuthMessage { challenge(1): DeviceAuthChallenge { sender_nonce(1): bytes } }
+	let i = 0;
+	while (i < msg.length) {
+		const tag = msg[i++];
+		const fieldNum = tag >> 3;
+		const wireType = tag & 0x7;
+		if (wireType === 2) {
+			let len = 0, shift = 0;
+			while (i < msg.length) { const b = msg[i++]; len |= (b & 0x7f) << shift; shift += 7; if (!(b & 0x80)) break; }
+			const sub = msg.slice(i, i + len);
+			i += len;
+			if (fieldNum === 1) {
+				// parse DeviceAuthChallenge for sender_nonce (field 1)
+				let j = 0;
+				while (j < sub.length) {
+					const t = sub[j++];
+					const fn = t >> 3, wt = t & 0x7;
+					if (wt === 2) {
+						let l = 0, s = 0;
+						while (j < sub.length) { const b = sub[j++]; l |= (b & 0x7f) << s; s += 7; if (!(b & 0x80)) break; }
+						if (fn === 1) return sub.slice(j, j + l);
+						j += l;
+					} else if (wt === 0) { while (j < sub.length && (sub[j++] & 0x80)); }
+				}
+			}
+		} else if (wireType === 0) { while (i < msg.length && (msg[i++] & 0x80)); }
+	}
+	return null;
+}
+
+function buildCastBinaryMessage(src: string, dst: string, ns: string, payload: Buffer): Buffer {
+	const body = Buffer.concat([
+		pbVarintField(1, 0),
+		pbLenDelim(2, Buffer.from(src, "utf8")),
+		pbLenDelim(3, Buffer.from(dst, "utf8")),
+		pbLenDelim(4, Buffer.from(ns, "utf8")),
+		pbVarintField(5, 1),      // payload_type: BINARY
+		pbLenDelim(7, payload),
+	]);
+	const hdr = Buffer.allocUnsafe(4);
+	hdr.writeUInt32BE(body.length, 0);
+	return Buffer.concat([hdr, body]);
+}
+
+function handleDeviceAuth(
+	server: CastServerInstance,
+	clientId: string,
+	sourceId: string,
+	rawData: string,
+	forgeKey: forge.pki.rsa.PrivateKey,
+	certPem: string,
+): void {
+	const buf = Buffer.isBuffer(rawData)
+		? (rawData as unknown as Buffer)
+		: Buffer.from(rawData as string, "binary");
+
+	const nonce = parseDeviceAuthNonce(buf);
+	if (!nonce) {
+		console.warn("[deviceauth] could not extract sender_nonce");
+		return;
+	}
+
+	const md = forge.md.sha256.create();
+	md.update(nonce.toString("binary"));
+	const sig = Buffer.from(forgeKey.sign(md), "binary");
+
+	const certDER = Buffer.from(
+		forge.asn1.toDer(forge.pki.certificateToAsn1(forge.pki.certificateFromPem(certPem))).getBytes(),
+		"binary",
+	);
+
+	// DeviceAuthMessage { response(2): DeviceAuthResponse { sig(1), cert(2), alg(4), nonce(5), hash(6) } }
+	const responsePb = pbLenDelim(2, Buffer.concat([
+		pbLenDelim(1, sig),
+		pbLenDelim(2, certDER),
+		pbVarintField(4, 1),       // signature_algorithm: RSASSA_PKCS1v15
+		pbLenDelim(5, nonce),
+		pbVarintField(6, 2),       // hash_algorithm: SHA256
+	]));
+
+	const castMsg = buildCastBinaryMessage("receiver-0", sourceId, NS_DEVICEAUTH, responsePb);
+
+	// castv2 server.send() only supports STRING payloads; write binary directly to the socket
+	const socket = (server as unknown as { clients: Record<string, { write: (b: Buffer) => void } | undefined> }).clients?.[clientId];
+	if (!socket) {
+		console.warn("[deviceauth] no socket for client", clientId);
+		return;
+	}
+	socket.write(castMsg);
+	console.log("[deviceauth] sent DeviceAuthResponse for nonce length", nonce.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +427,14 @@ function handleMessage(
 	destinationId: string,
 	namespace: string,
 	rawData: string,
+	forgeKey: forge.pki.rsa.PrivateKey,
+	certPem: string,
 ): void {
+	if (namespace === NS_DEVICEAUTH) {
+		handleDeviceAuth(server, clientId, sourceId, rawData, forgeKey, certPem);
+		return;
+	}
+
 	const state = getSession(clientId);
 
 	function reply(ns: string, payload: Record<string, unknown>): void {
@@ -315,7 +445,7 @@ function handleMessage(
 	try {
 		data = JSON.parse(rawData) as Record<string, unknown>;
 	} catch {
-		console.warn(`[cast] non-JSON payload in ns=${namespace} (binary DeviceAuth?)`);
+		console.warn(`[cast] non-JSON payload in ns=${namespace}`);
 		return;
 	}
 
@@ -473,18 +603,18 @@ function unregisterAvahiService(): void {
 async function main(): Promise<void> {
 	ensureSnapfifo();
 
-	const { cert, key } = loadOrCreateCert();
+	const certPair = loadOrCreateCert();
 	const identity = loadOrCreateDeviceIdentity();
 
 	registerAvahiService(identity);
 
-	const server = new CastServer({ cert, key });
+	const server = new CastServer({ cert: certPair.cert, key: certPair.key });
 
 	server.on(
 		"message",
 		(clientId, sourceId, destinationId, namespace, data) => {
 			console.log(`[cast] client=${clientId} ns=${namespace}`);
-			handleMessage(server, clientId, sourceId, destinationId, namespace, data);
+			handleMessage(server, clientId, sourceId, destinationId, namespace, data, certPair.forgeKey, certPair.cert);
 		},
 	);
 

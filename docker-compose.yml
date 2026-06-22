@@ -1,0 +1,48 @@
+services:
+  castbridge:
+    build:
+      context: ./castbridge
+      dockerfile: Dockerfile
+    container_name: castbridge
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - DEVICE_NAME=${DEVICE_NAME:-Multiroom}
+    volumes:
+      - snapfifo:/snapfifo
+      - castbridge-certs:/certs
+
+  snapserver:
+    image: badaix/snapserver:latest
+    container_name: snapserver
+    restart: unless-stopped
+    depends_on:
+      - castbridge
+    ports:
+      - "1704:1704"
+      - "1705:1705"
+      - "1780:1780"
+    volumes:
+      - snapfifo:/snapfifo
+    command:
+      - "--stream.source"
+      - "pipe:///snapfifo/snapfifo?name=YouTube&sampleformat=48000:16:2&codec=pcm"
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.snapcast.rule=Host(`${SNAPCAST_HOST}`)"
+      - "traefik.http.routers.snapcast.tls=true"
+      - "traefik.http.routers.snapcast.tls.certresolver=porkbun"
+      - "traefik.http.routers.snapcast.entrypoints=websecure"
+      - "traefik.http.services.snapcast.loadbalancer.server.port=1780"
+
+volumes:
+  snapfifo:
+    driver: local
+  castbridge-certs:
+    driver: local
+
+networks:
+  traefik:
+    external: true

@@ -315,6 +315,7 @@ function handleMessage(
 	try {
 		data = JSON.parse(rawData) as Record<string, unknown>;
 	} catch {
+		console.warn(`[cast] non-JSON payload in ns=${namespace} (binary DeviceAuth?)`);
 		return;
 	}
 
@@ -482,6 +483,7 @@ async function main(): Promise<void> {
 	server.on(
 		"message",
 		(clientId, sourceId, destinationId, namespace, data) => {
+			console.log(`[cast] client=${clientId} ns=${namespace}`);
 			handleMessage(server, clientId, sourceId, destinationId, namespace, data);
 		},
 	);

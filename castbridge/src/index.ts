@@ -444,28 +444,13 @@ const AVAHI_SERVICES_DIR = "/etc/avahi/services";
 const AVAHI_SERVICE_FILE = path.join(AVAHI_SERVICES_DIR, "cast-multiroom.xml");
 
 function registerAvahiService(identity: DeviceIdentity): void {
-	const xml = `<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="no">${DEVICE_NAME}</name>
-  <service>
-    <type>_googlecast._tcp</type>
-    <port>${CAST_PORT}</port>
-    <txt-record>id=${identity.id}</txt-record>
-    <txt-record>cd=${identity.cd}</txt-record>
-    <txt-record>rm=</txt-record>
-    <txt-record>ve=05</txt-record>
-    <txt-record>md=${DEVICE_NAME}</txt-record>
-    <txt-record>ic=/setup/icon.png</txt-record>
-    <txt-record>fn=${DEVICE_NAME}</txt-record>
-    <txt-record>ca=4101</txt-record>
-    <txt-record>st=0</txt-record>
-    <txt-record>bs=${identity.bs}</txt-record>
-    <txt-record>nf=1</txt-record>
-    <txt-record>rs=</txt-record>
-  </service>
-</service-group>
-`;
+	const records = [
+		`id=${identity.id}`, `cd=${identity.cd}`, `rm=`, `ve=05`,
+		`md=${DEVICE_NAME}`, `ic=/setup/icon.png`, `fn=${DEVICE_NAME}`,
+		`ca=4101`, `st=0`, `bs=${identity.bs}`, `nf=1`, `rs=`,
+	].map((r) => `<txt-record>${r}</txt-record>`).join("");
+
+	const xml = `<service-group><name replace-wildcards="no">${DEVICE_NAME}</name><service><type>_googlecast._tcp</type><port>${CAST_PORT}</port>${records}</service></service-group>\n`;
 	fs.mkdirSync(AVAHI_SERVICES_DIR, { recursive: true });
 	fs.writeFileSync(AVAHI_SERVICE_FILE, xml);
 	console.log(`mDNS: wrote avahi service file for "${DEVICE_NAME}"`);

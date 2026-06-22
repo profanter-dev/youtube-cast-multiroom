@@ -331,5 +331,10 @@ def api_status():
 
 
 if __name__ == "__main__":
+    if os.path.exists(COOKIES_FILE):
+        print(f"[ytdlp] using cookies from {COOKIES_FILE}")
+    else:
+        print(f"[ytdlp] no cookies file at {COOKIES_FILE} — playback works "
+              "until YouTube demands a 'not a bot' check")
     print(f"[musicbridge] serving on :{PORT}, FIFO={SNAPFIFO}")
     serve(app, host="0.0.0.0", port=PORT, threads=8)

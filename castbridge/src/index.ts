@@ -662,6 +662,11 @@ async function main(): Promise<void> {
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const tlsServer = (server as any).server;
+	tlsServer?.on("connection", (rawSocket: { remoteAddress?: string; remotePort?: number; once: Function }) => {
+		const src = `${rawSocket.remoteAddress}:${rawSocket.remotePort}`;
+		console.log(`[tcp] connect ${src}`);
+		rawSocket.once("close", () => console.log(`[tcp] close  ${src}`));
+	});
 	tlsServer?.on("tlsClientError", (err: Error, socket: { remoteAddress?: string }) => {
 		console.error(`[tls] handshake error from ${socket.remoteAddress ?? "?"}: ${err.message}`);
 	});

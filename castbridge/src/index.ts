@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
+import * as tls from "tls";
 import { EventEmitter } from "events";
 import { execSync, spawn, ChildProcess } from "child_process";
 import forge from "node-forge";
@@ -642,7 +643,17 @@ async function main(): Promise<void> {
 
 	registerAvahiService(identity);
 
-	const server = new CastServer({ cert: certPair.cert, key: certPair.key });
+	// SNICallback fires on ClientHello (before we send anything), so it logs
+	// the SNI hostname even for connections that fail TLS.
+	const sniCtx = tls.createSecureContext({ cert: certPair.cert, key: certPair.key });
+	const server = new CastServer({
+		cert: certPair.cert,
+		key: certPair.key,
+		SNICallback: (servername: string, cb: (err: Error | null, ctx: tls.SecureContext | null) => void) => {
+			console.log(`[tls] SNI: "${servername || "(none)"}"`);
+			cb(null, sniCtx);
+		},
+	} as unknown as { cert: string; key: string });
 
 	server.on(
 		"message",
@@ -670,8 +681,8 @@ async function main(): Promise<void> {
 	tlsServer?.on("tlsClientError", (err: Error, socket: { remoteAddress?: string }) => {
 		console.error(`[tls] handshake error from ${socket.remoteAddress ?? "?"}: ${err.message}`);
 	});
-	tlsServer?.on("secureConnection", (socket: { remoteAddress?: string; getProtocol?: () => string }) => {
-		console.log(`[tls] secure connection from ${socket.remoteAddress ?? "?"} (${socket.getProtocol?.() ?? "?"})`);
+	tlsServer?.on("secureConnection", (socket: { remoteAddress?: string; getProtocol?: () => string; servername?: string }) => {
+		console.log(`[tls] secure from ${socket.remoteAddress ?? "?"} (${socket.getProtocol?.() ?? "?"}) SNI=${socket.servername || "(none)"}`);
 	});
 
 	process.on("SIGTERM", () => {

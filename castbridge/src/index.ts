@@ -441,7 +441,7 @@ function loadOrCreateDeviceIdentity(): DeviceIdentity {
 // ---------------------------------------------------------------------------
 
 const AVAHI_SERVICES_DIR = "/etc/avahi/services";
-const AVAHI_SERVICE_FILE = path.join(AVAHI_SERVICES_DIR, "cast-multiroom.xml");
+const AVAHI_SERVICE_FILE = path.join(AVAHI_SERVICES_DIR, "cast-multiroom.service");
 
 function registerAvahiService(identity: DeviceIdentity): void {
 	const records = [

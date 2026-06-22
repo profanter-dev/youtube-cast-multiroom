@@ -13,7 +13,9 @@ services:
       - ${DATA_DIR}/certs:/certs
 
   snapserver:
-    image: ghcr.io/badaix/snapcast:server-latest
+    build:
+      context: ./snapserver
+      dockerfile: Dockerfile
     container_name: snapserver
     restart: unless-stopped
     depends_on:

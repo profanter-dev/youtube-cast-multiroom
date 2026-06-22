@@ -14,10 +14,17 @@ Synchronized multiroom YouTube Music receiver built on a fake Chromecast device 
 git clone https://github.com/YOUR_USERNAME/youtube-cast-multiroom
 cd youtube-cast-multiroom
 cp .env.example .env          # edit DEVICE_NAME if you want a different cast target name
-docker compose up -d
+docker compose up -d --build
 ```
 
 > **Note:** castbridge runs with `network_mode: host` so mDNS multicast packets reach the LAN. The host running Docker must be on the same network segment as your phone for mDNS discovery to work.
+
+## Updating snapserver
+
+The snapserver version is pinned in `snapserver/Dockerfile` (`SNAPCAST_VERSION`). To update:
+
+1. Change `SNAPCAST_VERSION` to the new version number.
+2. Rebuild and restart: `docker compose build snapserver && docker compose up -d snapserver`
 
 ## Install Snapdroid on each Google TV
 

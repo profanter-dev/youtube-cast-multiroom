@@ -27,4 +27,4 @@ RUN yarn tsc
 # Remove devDependencies after build
 RUN yarn install --frozen-lockfile --ignore-scripts --production
 
-ENTRYPOINT ["node", "--tls-max-v1.2", "dist/index.js"]
+ENTRYPOINT ["node", "dist/index.js"]

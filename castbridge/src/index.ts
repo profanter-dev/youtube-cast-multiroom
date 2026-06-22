@@ -32,20 +32,18 @@ interface CertPair {
 	forgeKey: forge.pki.rsa.PrivateKey;
 }
 
-function loadOrCreateCert(): CertPair {
-	const certFile = path.join(CERTS_DIR, "cast.crt");
-	const keyFile = path.join(CERTS_DIR, "cast.key");
-
-	if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
-		console.log("Loaded existing TLS certificate from volume.");
-		const keyPem = fs.readFileSync(keyFile, "utf8");
-		return {
-			cert: fs.readFileSync(certFile, "utf8"),
-			key: keyPem,
-			forgeKey: forge.pki.privateKeyFromPem(keyPem) as forge.pki.rsa.PrivateKey,
-		};
+function certHasSAN(certPem: string): boolean {
+	try {
+		const c = forge.pki.certificateFromPem(certPem);
+		return c.extensions.some(
+			(e: { name?: string }) => e.name === "subjectAltName",
+		);
+	} catch {
+		return false;
 	}
+}
 
+function generateCert(): CertPair {
 	console.log("Generating self-signed TLS certificate…");
 	const keys = forge.pki.rsa.generateKeyPair(2048);
 	const cert = forge.pki.createCertificate();
@@ -53,9 +51,7 @@ function loadOrCreateCert(): CertPair {
 	cert.serialNumber = "01";
 	cert.validity.notBefore = new Date();
 	cert.validity.notAfter = new Date();
-	cert.validity.notAfter.setFullYear(
-		cert.validity.notBefore.getFullYear() + 10,
-	);
+	cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 10);
 
 	const attrs = [
 		{ name: "commonName", value: DEVICE_NAME },
@@ -63,17 +59,45 @@ function loadOrCreateCert(): CertPair {
 	];
 	cert.setSubject(attrs);
 	cert.setIssuer(attrs);
+	// SubjectAltName is required by modern TLS clients (BoringSSL/Android enforces
+	// its presence in TLS 1.3 even without hostname verification)
+	cert.setExtensions([{
+		name: "subjectAltName",
+		altNames: [{ type: 2, value: `${DEVICE_NAME}.local` }],
+	}]);
 	cert.sign(keys.privateKey, forge.md.sha256.create());
 
 	const certPem = forge.pki.certificateToPem(cert);
 	const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
 
 	fs.mkdirSync(CERTS_DIR, { recursive: true });
-	fs.writeFileSync(certFile, certPem);
-	fs.writeFileSync(keyFile, keyPem);
+	fs.writeFileSync(path.join(CERTS_DIR, "cast.crt"), certPem);
+	fs.writeFileSync(path.join(CERTS_DIR, "cast.key"), keyPem);
 	console.log("TLS certificate written to volume.");
 
 	return { cert: certPem, key: keyPem, forgeKey: keys.privateKey };
+}
+
+function loadOrCreateCert(): CertPair {
+	const certFile = path.join(CERTS_DIR, "cast.crt");
+	const keyFile = path.join(CERTS_DIR, "cast.key");
+
+	if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+		const certPem = fs.readFileSync(certFile, "utf8");
+		if (!certHasSAN(certPem)) {
+			console.log("Existing TLS cert lacks SubjectAltName — regenerating…");
+			return generateCert();
+		}
+		console.log("Loaded existing TLS certificate from volume.");
+		const keyPem = fs.readFileSync(keyFile, "utf8");
+		return {
+			cert: certPem,
+			key: keyPem,
+			forgeKey: forge.pki.privateKeyFromPem(keyPem) as forge.pki.rsa.PrivateKey,
+		};
+	}
+
+	return generateCert();
 }
 
 // ---------------------------------------------------------------------------

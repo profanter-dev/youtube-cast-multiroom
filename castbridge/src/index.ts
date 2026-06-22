@@ -496,6 +496,12 @@ async function main(): Promise<void> {
 		console.log(`castbridge listening on port ${CAST_PORT}`);
 	});
 
+	// Log TLS handshake failures (e.g. version or cipher mismatch with Cast SDK)
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	(server as any).server?.on("tlsClientError", (err: Error) => {
+		console.error("[tls] client error:", err.message);
+	});
+
 	process.on("SIGTERM", () => {
 		console.log("SIGTERM received — stopping playback and exiting.");
 		stopPlayback();

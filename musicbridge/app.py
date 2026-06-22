@@ -205,7 +205,8 @@ class Engine:
             # `docker compose logs musicbridge`.
             self._ytdlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE)
             self._ffmpeg = subprocess.Popen(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                # -y: don't refuse to "overwrite" the FIFO, which always exists.
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                  "-i", "pipe:0", "-f", "s16le",
                  "-ar", SAMPLE_RATE, "-ac", CHANNELS, SNAPFIFO],
                 stdin=self._ytdlp.stdout,

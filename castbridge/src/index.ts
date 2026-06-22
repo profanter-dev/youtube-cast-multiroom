@@ -643,17 +643,66 @@ async function main(): Promise<void> {
 
 	registerAvahiService(identity);
 
-	// SNICallback fires on ClientHello (before we send anything), so it logs
-	// the SNI hostname even for connections that fail TLS.
-	const sniCtx = tls.createSecureContext({ cert: certPair.cert, key: certPair.key });
-	const server = new CastServer({
+	// Explicit TLS options. castv2 just does `new tls.Server(options)`, so any
+	// tls.createServer option can be passed through here.
+	//
+	// Why this matters: modern Android Cast senders (the YouTube Music app on a
+	// recent phone) negotiate TLS via a newer BoringSSL than older receivers
+	// (e.g. a BRAVIA TV) and than `openssl s_client`. With a self-signed RSA
+	// cert, BoringSSL will only complete the handshake if the server offers an
+	// ECDHE_RSA cipher suite over a curve the client also offers. Node's default
+	// cipher list and ECDH curve selection were fine for TLS 1.3 (X25519 with
+	// openssl) and for the TV, but the phone's ClientHello was being aborted.
+	//
+	// We therefore:
+	//   - allow both TLS 1.2 and 1.3 (no downgrade tricks — forcing 1.2 earlier
+	//     triggered RFC 8446 downgrade detection),
+	//   - offer a broad set of ECDHE_RSA + AES-GCM/CHACHA suites,
+	//   - offer all common ECDH curves so the client's preferred curve is present,
+	//   - let the client choose the cipher (honorCipherOrder: false), which is
+	//     what real Chromecasts do and what BoringSSL expects.
+	const tlsOptions = {
 		cert: certPair.cert,
 		key: certPair.key,
-		SNICallback: (servername: string, cb: (err: Error | null, ctx: tls.SecureContext | null) => void) => {
+		minVersion: "TLSv1.2" as const,
+		maxVersion: "TLSv1.3" as const,
+		honorCipherOrder: false,
+		ecdhCurve: "X25519:prime256v1:secp384r1:secp521r1",
+		ciphers: [
+			// TLS 1.3 suites (named via the 1.3 ciphersuites mechanism)
+			"TLS_AES_128_GCM_SHA256",
+			"TLS_AES_256_GCM_SHA384",
+			"TLS_CHACHA20_POLY1305_SHA256",
+			// TLS 1.2 ECDHE_RSA suites that BoringSSL offers
+			"ECDHE-RSA-AES128-GCM-SHA256",
+			"ECDHE-RSA-AES256-GCM-SHA384",
+			"ECDHE-RSA-CHACHA20-POLY1305",
+			"ECDHE-RSA-AES128-SHA",
+			"ECDHE-RSA-AES256-SHA",
+			// Plain RSA fallbacks (no forward secrecy, last resort)
+			"AES128-GCM-SHA256",
+			"AES256-GCM-SHA384",
+			"AES128-SHA",
+			"AES256-SHA",
+		].join(":"),
+		// SNICallback fires on ClientHello, before anything is sent, so it logs
+		// the SNI hostname even for connections that go on to fail. It MUST never
+		// throw and MUST return a context built with the SAME cipher/curve options
+		// as the server itself — a context from a bare createSecureContext() uses
+		// only Node's defaults and can break otherwise-valid handshakes.
+		SNICallback: (
+			servername: string,
+			cb: (err: Error | null, ctx?: tls.SecureContext) => void,
+		) => {
 			console.log(`[tls] SNI: "${servername || "(none)"}"`);
-			cb(null, sniCtx);
+			// Returning no context lets Node fall back to the server's default
+			// secure context (built from the options above), so we keep the
+			// configured ciphers/curves instead of overriding them.
+			cb(null);
 		},
-	} as unknown as { cert: string; key: string });
+	};
+
+	const server = new CastServer(tlsOptions as unknown as { cert: string; key: string });
 
 	server.on(
 		"message",

@@ -435,48 +435,49 @@ function loadOrCreateDeviceIdentity(): DeviceIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// mDNS advertisement
+// mDNS advertisement — write a static avahi service file that avahi-daemon
+// picks up via inotify. More reliable than avahi-publish D-Bus registration
+// which silently fails under TrueNAS's avahi sandboxing.
 // ---------------------------------------------------------------------------
 
-function advertiseMdns(identity: DeviceIdentity): void {
-	const txtArgs = [
-		`id=${identity.id}`,
-		`cd=${identity.cd}`,
-		`rm=`,
-		`ve=05`,
-		`md=${DEVICE_NAME}`,
-		`ic=/setup/icon.png`,
-		`fn=${DEVICE_NAME}`,
-		`ca=4101`,
-		`st=0`,
-		`bs=${identity.bs}`,
-		`nf=1`,
-		`rs=`,
-	];
+const AVAHI_SERVICES_DIR = "/etc/avahi/services";
+const AVAHI_SERVICE_FILE = path.join(AVAHI_SERVICES_DIR, "cast-multiroom.xml");
 
-	// avahi-publish -s talks to the host avahi-daemon via D-Bus, so it never
-	// tries to bind port 5353 itself and won't conflict with the host daemon.
-	// Restart automatically if avahi-daemon is restarted by the OS.
-	function start(): void {
-		const proc = spawn(
-			"avahi-publish",
-			["-s", DEVICE_NAME, "_googlecast._tcp", String(CAST_PORT), ...txtArgs],
-			{ stdio: "inherit" },
-		);
+function registerAvahiService(identity: DeviceIdentity): void {
+	const xml = `<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="no">${DEVICE_NAME}</name>
+  <service>
+    <type>_googlecast._tcp</type>
+    <port>${CAST_PORT}</port>
+    <txt-record>id=${identity.id}</txt-record>
+    <txt-record>cd=${identity.cd}</txt-record>
+    <txt-record>rm=</txt-record>
+    <txt-record>ve=05</txt-record>
+    <txt-record>md=${DEVICE_NAME}</txt-record>
+    <txt-record>ic=/setup/icon.png</txt-record>
+    <txt-record>fn=${DEVICE_NAME}</txt-record>
+    <txt-record>ca=4101</txt-record>
+    <txt-record>st=0</txt-record>
+    <txt-record>bs=${identity.bs}</txt-record>
+    <txt-record>nf=1</txt-record>
+    <txt-record>rs=</txt-record>
+  </service>
+</service-group>
+`;
+	fs.mkdirSync(AVAHI_SERVICES_DIR, { recursive: true });
+	fs.writeFileSync(AVAHI_SERVICE_FILE, xml);
+	console.log(`mDNS: wrote avahi service file for "${DEVICE_NAME}"`);
+}
 
-		proc.on("error", (err) => {
-			console.error("avahi-publish error:", err.message);
-			setTimeout(start, 5000);
-		});
-
-		proc.on("exit", (code) => {
-			console.error(`avahi-publish exited (code ${code ?? "null"}), restarting in 5s`);
-			setTimeout(start, 5000);
-		});
+function unregisterAvahiService(): void {
+	try {
+		fs.unlinkSync(AVAHI_SERVICE_FILE);
+		console.log("mDNS: removed avahi service file");
+	} catch {
+		// ignore if already gone
 	}
-
-	start();
-	console.log(`mDNS: advertising "${DEVICE_NAME}" as _googlecast._tcp on port ${CAST_PORT}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +490,7 @@ async function main(): Promise<void> {
 	const { cert, key } = loadOrCreateCert();
 	const identity = loadOrCreateDeviceIdentity();
 
-	advertiseMdns(identity);
+	registerAvahiService(identity);
 
 	const server = new CastServer({ cert, key });
 
@@ -511,6 +512,7 @@ async function main(): Promise<void> {
 	process.on("SIGTERM", () => {
 		console.log("SIGTERM received — stopping playback and exiting.");
 		stopPlayback();
+		unregisterAvahiService();
 		process.exit(0);
 	});
 }

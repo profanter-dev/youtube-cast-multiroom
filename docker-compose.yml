@@ -11,7 +11,7 @@ services:
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ${DATA_DIR}/certs:/certs
-      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /etc/avahi/services:/etc/avahi/services
 
   snapserver:
     build:
@@ -28,7 +28,6 @@ services:
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ./snapserver/snapserver.conf:/etc/snapserver.conf:ro
-      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
     networks:
       - traefik
     labels:

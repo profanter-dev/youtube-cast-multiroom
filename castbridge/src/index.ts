@@ -406,48 +406,77 @@ function handleMessage(
 }
 
 // ---------------------------------------------------------------------------
+// Device identity — persisted so the Cast device ID is stable across restarts
+// ---------------------------------------------------------------------------
+
+interface DeviceIdentity {
+	id: string; // 32 lowercase hex (UUID without dashes)
+	cd: string; // 32 uppercase hex
+	bs: string; // 12 uppercase hex (MAC-like)
+}
+
+function loadOrCreateDeviceIdentity(): DeviceIdentity {
+	const identityFile = path.join(CERTS_DIR, "device-identity.json");
+
+	if (fs.existsSync(identityFile)) {
+		return JSON.parse(fs.readFileSync(identityFile, "utf8")) as DeviceIdentity;
+	}
+
+	const identity: DeviceIdentity = {
+		id: uuidv4().replace(/-/g, ""),
+		cd: crypto.randomBytes(16).toString("hex").toUpperCase(),
+		bs: crypto.randomBytes(6).toString("hex").toUpperCase(),
+	};
+
+	fs.mkdirSync(CERTS_DIR, { recursive: true });
+	fs.writeFileSync(identityFile, JSON.stringify(identity, null, 2));
+	console.log("Generated new device identity.");
+	return identity;
+}
+
+// ---------------------------------------------------------------------------
 // mDNS advertisement
 // ---------------------------------------------------------------------------
 
-function advertiseMdns(): void {
-	const deviceId = crypto
-		.randomBytes(6)
-		.toString("hex")
-		.replace(/../g, (h) => h + ":")
-		.slice(0, -1);
-
-	const id = uuidv4().replace(/-/g, "");
+function advertiseMdns(identity: DeviceIdentity): void {
+	const txtArgs = [
+		`id=${identity.id}`,
+		`cd=${identity.cd}`,
+		`rm=`,
+		`ve=05`,
+		`md=${DEVICE_NAME}`,
+		`ic=/setup/icon.png`,
+		`fn=${DEVICE_NAME}`,
+		`ca=4101`,
+		`st=0`,
+		`bs=${identity.bs}`,
+		`nf=1`,
+		`rs=`,
+	];
 
 	// avahi-publish -s talks to the host avahi-daemon via D-Bus, so it never
 	// tries to bind port 5353 itself and won't conflict with the host daemon.
-	const proc = spawn(
-		"avahi-publish",
-		[
-			"-s", DEVICE_NAME, "_googlecast._tcp", String(CAST_PORT),
-			`id=${id}`,
-			`cd=${deviceId}`,
-			`rm=`,
-			`ve=05`,
-			`md=${DEVICE_NAME}`,
-			`ic=/setup/icon.png`,
-			`fn=${DEVICE_NAME}`,
-			`ca=4101`,
-			`st=0`,
-			`bs=${deviceId}`,
-			`rs=`,
-		],
-		{ stdio: "inherit" },
-	);
+	// Restart automatically if avahi-daemon is restarted by the OS.
+	function start(): void {
+		const proc = spawn(
+			"avahi-publish",
+			["-s", DEVICE_NAME, "_googlecast._tcp", String(CAST_PORT), ...txtArgs],
+			{ stdio: "inherit" },
+		);
 
-	proc.on("error", (err) => console.error("avahi-publish error:", err));
-	proc.on("exit", (code) => {
-		if (code !== 0 && code !== null)
-			console.error(`avahi-publish exited with code ${code}`);
-	});
+		proc.on("error", (err) => {
+			console.error("avahi-publish error:", err.message);
+			setTimeout(start, 5000);
+		});
 
-	console.log(
-		`mDNS: advertising "${DEVICE_NAME}" as _googlecast._tcp on port ${CAST_PORT}`,
-	);
+		proc.on("exit", (code) => {
+			console.error(`avahi-publish exited (code ${code ?? "null"}), restarting in 5s`);
+			setTimeout(start, 5000);
+		});
+	}
+
+	start();
+	console.log(`mDNS: advertising "${DEVICE_NAME}" as _googlecast._tcp on port ${CAST_PORT}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -458,8 +487,9 @@ async function main(): Promise<void> {
 	ensureSnapfifo();
 
 	const { cert, key } = loadOrCreateCert();
+	const identity = loadOrCreateDeviceIdentity();
 
-	advertiseMdns();
+	advertiseMdns(identity);
 
 	const server = new CastServer({ cert, key });
 

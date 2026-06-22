@@ -13,7 +13,7 @@ services:
       - castbridge-certs:/certs
 
   snapserver:
-    image: badaix/snapserver:latest
+    image: ghcr.io/badaix/snapcast:server-latest
     container_name: snapserver
     restart: unless-stopped
     depends_on:

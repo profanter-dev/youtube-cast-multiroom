@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
@@ -36,7 +37,12 @@ function certHasRequiredExtensions(certPem: string): boolean {
 	try {
 		const c = forge.pki.certificateFromPem(certPem);
 		const names = c.extensions.map((e: { name?: string }) => e.name ?? "");
-		return names.includes("subjectAltName") && names.includes("keyUsage");
+		if (!names.includes("subjectAltName") || !names.includes("keyUsage")) return false;
+		// Require at least one iPAddress SAN so Cast SDK hostname verification
+		// against the server IP passes (DNS SAN does not match IP connections per RFC 6125)
+		const san = c.extensions.find((e: { name?: string }) => e.name === "subjectAltName") as
+			{ altNames?: Array<{ type: number }> } | undefined;
+		return (san?.altNames ?? []).some((n) => n.type === 7);
 	} catch {
 		return false;
 	}
@@ -58,10 +64,23 @@ function generateCert(): CertPair {
 	];
 	cert.setSubject(attrs);
 	cert.setIssuer(attrs);
+	const localIps = Object.values(os.networkInterfaces())
+		.flat()
+		.filter((iface): iface is os.NetworkInterfaceInfo =>
+			!!iface && iface.family === "IPv4" && !iface.internal,
+		)
+		.map((i) => i.address);
+
+	console.log(`Certificate SANs: DNS:${DEVICE_NAME}.local` +
+		(localIps.length ? ", IP:" + localIps.join(", IP:") : " (no local IPs found)"));
+
 	cert.setExtensions([
 		{
 			name: "subjectAltName",
-			altNames: [{ type: 2, value: `${DEVICE_NAME}.local` }],
+			altNames: [
+				{ type: 2, value: `${DEVICE_NAME}.local` },
+				...localIps.map((ip) => ({ type: 7, ip })),
+			],
 		},
 		{ name: "basicConstraints", cA: false },
 		{ name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },

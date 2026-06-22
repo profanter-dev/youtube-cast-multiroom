@@ -195,7 +195,10 @@ function pbVarintField(fieldNum: number, value: number): Buffer {
 }
 
 function parseDeviceAuthNonce(msg: Buffer): Buffer | null {
-	// DeviceAuthMessage { challenge(1): DeviceAuthChallenge { sender_nonce(1): bytes } }
+	// DeviceAuthMessage { challenge(1): DeviceAuthChallenge { sender_nonce: bytes } }
+	// sender_nonce is field 1 in the Chromium proto, field 2 in some older implementations
+	// (e.g. BRAVIA TV sends: field2=nonce, field3=signature_algorithm).
+	// Try field 1 first, fall back to field 2.
 	let i = 0;
 	while (i < msg.length) {
 		const tag = msg[i++];
@@ -207,7 +210,9 @@ function parseDeviceAuthNonce(msg: Buffer): Buffer | null {
 			const sub = msg.slice(i, i + len);
 			i += len;
 			if (fieldNum === 1) {
-				// parse DeviceAuthChallenge for sender_nonce (field 1)
+				// parse DeviceAuthChallenge — prefer field 1, fall back to field 2
+				let nonceF1: Buffer | null = null;
+				let nonceF2: Buffer | null = null;
 				let j = 0;
 				while (j < sub.length) {
 					const t = sub[j++];
@@ -215,29 +220,18 @@ function parseDeviceAuthNonce(msg: Buffer): Buffer | null {
 					if (wt === 2) {
 						let l = 0, s = 0;
 						while (j < sub.length) { const b = sub[j++]; l |= (b & 0x7f) << s; s += 7; if (!(b & 0x80)) break; }
-						if (fn === 1) return sub.slice(j, j + l);
+						if (fn === 1) nonceF1 = sub.slice(j, j + l);
+						else if (fn === 2) nonceF2 = sub.slice(j, j + l);
 						j += l;
 					} else if (wt === 0) { while (j < sub.length && (sub[j++] & 0x80)); }
 				}
+				return nonceF1 ?? nonceF2;
 			}
 		} else if (wireType === 0) { while (i < msg.length && (msg[i++] & 0x80)); }
 	}
 	return null;
 }
 
-function buildCastBinaryMessage(src: string, dst: string, ns: string, payload: Buffer): Buffer {
-	const body = Buffer.concat([
-		pbVarintField(1, 0),
-		pbLenDelim(2, Buffer.from(src, "utf8")),
-		pbLenDelim(3, Buffer.from(dst, "utf8")),
-		pbLenDelim(4, Buffer.from(ns, "utf8")),
-		pbVarintField(5, 1),      // payload_type: BINARY
-		pbLenDelim(7, payload),
-	]);
-	const hdr = Buffer.allocUnsafe(4);
-	hdr.writeUInt32BE(body.length, 0);
-	return Buffer.concat([hdr, body]);
-}
 
 function handleDeviceAuth(
 	server: CastServerInstance,
@@ -277,16 +271,9 @@ function handleDeviceAuth(
 	];
 	const responsePb = pbLenDelim(2, Buffer.concat(responseFields));
 
-	const castMsg = buildCastBinaryMessage("receiver-0", sourceId, NS_DEVICEAUTH, responsePb);
-
-	// castv2 server.send() only supports STRING payloads; write binary directly to the socket
-	const socket = (server as unknown as { clients: Record<string, { write: (b: Buffer) => void } | undefined> }).clients?.[clientId];
-	if (!socket) {
-		console.warn("[deviceauth] no socket for client", clientId);
-		return;
-	}
-	socket.write(castMsg);
-	console.log("[deviceauth] sent DeviceAuthResponse for nonce length", nonce.length);
+	// server.send() checks Buffer.isBuffer(data) and sets payloadType=BINARY automatically
+	server.send(clientId, "receiver-0", sourceId, NS_DEVICEAUTH, responsePb as unknown as string);
+	console.log("[deviceauth] sent DeviceAuthResponse, nonce length:", nonce.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +288,7 @@ interface CastServerInstance extends EventEmitter {
 		sourceId: string,
 		destinationId: string,
 		namespace: string,
-		data: string,
+		data: string | Buffer,
 	): void;
 	close(): void;
 	on(

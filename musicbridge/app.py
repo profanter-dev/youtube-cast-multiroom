@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -30,6 +31,9 @@ from ytmusicapi import YTMusic
 AUTH_FILE = os.environ.get("YTM_AUTH_FILE", "/data/browser.json")
 SNAPFIFO = os.environ.get("SNAPFIFO", "/snapfifo/snapfifo")
 PORT = int(os.environ.get("PORT", "8080"))
+# Optional Netscape cookies.txt for yt-dlp, used if present. YouTube increasingly
+# demands cookies ("confirm you're not a bot") for stream extraction.
+COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "/data/cookies.txt")
 
 # Snapcast stream format — MUST match snapserver.conf (sampleformat=48000:16:2).
 SAMPLE_RATE = "48000"
@@ -183,27 +187,43 @@ class Engine:
                 self._skipped = False
                 track = self.current
 
-            self._play_blocking(track["videoId"])
+            self._play_blocking(track)
 
-    def _play_blocking(self, video_id: str):
+    def _play_blocking(self, track: dict):
+        video_id = track["videoId"]
         url = f"https://music.youtube.com/watch?v={video_id}"
+        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-o", "-",
+                     "--quiet", "--no-warnings", "--no-progress"]
+        if os.path.exists(COOKIES_FILE):
+            ytdlp_cmd += ["--cookies", COOKIES_FILE]
+        ytdlp_cmd.append(url)
+
+        started = time.monotonic()
+        print(f"[player] ▶ {track.get('title', video_id)} ({video_id})", flush=True)
         try:
-            self._ytdlp = subprocess.Popen(
-                ["yt-dlp", "-f", "bestaudio", "-o", "-", "--quiet",
-                 "--no-warnings", url],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
+            # stderr is inherited (not silenced) so yt-dlp/ffmpeg errors land in
+            # `docker compose logs musicbridge`.
+            self._ytdlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE)
             self._ffmpeg = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
                  "-i", "pipe:0", "-f", "s16le",
                  "-ar", SAMPLE_RATE, "-ac", CHANNELS, SNAPFIFO],
-                stdin=self._ytdlp.stdout, stderr=subprocess.DEVNULL,
+                stdin=self._ytdlp.stdout,
             )
             # Let ffmpeg own the read end so yt-dlp gets SIGPIPE if ffmpeg dies.
             self._ytdlp.stdout.close()
-            self._ffmpeg.wait()
+            ff_rc = self._ffmpeg.wait()
+            yt_rc = self._ytdlp.wait()
+            elapsed = time.monotonic() - started
+            print(f"[player] ■ ended after {elapsed:.1f}s "
+                  f"(ffmpeg={ff_rc}, yt-dlp={yt_rc})", flush=True)
+            if elapsed < 2 and not self._skipped:
+                print("[player] ⚠ ended almost instantly — yt-dlp could not get "
+                      "the stream (see its error above). If YouTube asks to "
+                      "'confirm you're not a bot', drop a Netscape cookies.txt at "
+                      f"{COOKIES_FILE}.", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the worker die
-            print(f"[player] error: {exc}")
+            print(f"[player] error: {exc}", flush=True)
         finally:
             self._signal_procs(signal.SIGCONT)  # in case we were paused
             for p in (self._ytdlp, self._ffmpeg):

@@ -27,9 +27,8 @@ services:
       - "1780:1780"
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
-    command:
-      - "--stream.source"
-      - "pipe:///snapfifo/snapfifo?name=YouTube&sampleformat=48000:16:2&codec=pcm"
+      - ./snapserver/snapserver.conf:/etc/snapserver.conf:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
     networks:
       - traefik
     labels:

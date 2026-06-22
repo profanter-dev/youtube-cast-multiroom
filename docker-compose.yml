@@ -9,8 +9,8 @@ services:
     environment:
       - DEVICE_NAME=${DEVICE_NAME:-Multiroom}
     volumes:
-      - snapfifo:/snapfifo
-      - castbridge-certs:/certs
+      - ${DATA_DIR}/snapfifo:/snapfifo
+      - ${DATA_DIR}/certs:/certs
 
   snapserver:
     image: ghcr.io/badaix/snapcast:server-latest
@@ -23,7 +23,7 @@ services:
       - "1705:1705"
       - "1780:1780"
     volumes:
-      - snapfifo:/snapfifo
+      - ${DATA_DIR}/snapfifo:/snapfifo
     command:
       - "--stream.source"
       - "pipe:///snapfifo/snapfifo?name=YouTube&sampleformat=48000:16:2&codec=pcm"
@@ -36,12 +36,6 @@ services:
       - "traefik.http.routers.snapcast.tls.certresolver=porkbun"
       - "traefik.http.routers.snapcast.entrypoints=websecure"
       - "traefik.http.services.snapcast.loadbalancer.server.port=1780"
-
-volumes:
-  snapfifo:
-    driver: local
-  castbridge-certs:
-    driver: local
 
 networks:
   traefik:

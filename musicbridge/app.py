@@ -13,14 +13,15 @@ Control surface: a password-protected web UI (Traefik basic-auth in front).
 """
 
 import os
+import random
 import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
 from ytmusicapi import YTMusic
 
@@ -40,21 +41,34 @@ SAMPLE_RATE = "48000"
 CHANNELS = "2"
 
 # --------------------------------------------------------------------------- #
-# YouTube Music account
+# YouTube Music account (lazy — never block server startup on a network call)
 # --------------------------------------------------------------------------- #
 
-
-def make_ytmusic() -> YTMusic:
-    """Authenticated client if browser.json is present, else search-only."""
-    if os.path.exists(AUTH_FILE):
-        print(f"[ytm] using account auth from {AUTH_FILE}")
-        return YTMusic(AUTH_FILE)
-    print(f"[ytm] no auth file at {AUTH_FILE} — running unauthenticated "
-          "(public search only, no library/playlists)")
-    return YTMusic()
+_ytmusic: Optional[YTMusic] = None
+_ytmusic_lock = threading.Lock()
 
 
-ytmusic = make_ytmusic()
+def get_ytmusic() -> YTMusic:
+    """Build the YTMusic client on first use, not at import time.
+
+    The YTMusic() constructor makes a network request to YouTube. Doing that at
+    import time means a slow/blocked request (e.g. an anti-bot rate limit on the
+    host IP) would stop the web server from ever starting — the page would just
+    "load forever". Building it lazily keeps the UI responsive no matter what.
+    """
+    global _ytmusic
+    if _ytmusic is None:
+        with _ytmusic_lock:
+            if _ytmusic is None:
+                if os.path.exists(AUTH_FILE):
+                    print(f"[ytm] using account auth from {AUTH_FILE}", flush=True)
+                    _ytmusic = YTMusic(AUTH_FILE)
+                else:
+                    print(f"[ytm] no auth file at {AUTH_FILE} — running "
+                          "unauthenticated (public search only, no "
+                          "library/playlists)", flush=True)
+                    _ytmusic = YTMusic()
+    return _ytmusic
 
 
 def normalize_track(item: dict) -> Optional[dict]:
@@ -73,6 +87,7 @@ def normalize_track(item: dict) -> Optional[dict]:
         "artist": artist,
         "album": album.get("name") if isinstance(album, dict) else None,
         "thumb": thumb,
+        "duration": item.get("duration_seconds"),
     }
 
 
@@ -87,10 +102,16 @@ class Engine:
     history: list = field(default_factory=list)      # finished/played tracks
     current: Optional[dict] = None
     paused: bool = False
+    shuffle: bool = False
+    repeat: str = "off"                              # "off" | "all" | "one"
     _ytdlp: Optional[subprocess.Popen] = None
     _ffmpeg: Optional[subprocess.Popen] = None
     _stop: bool = False
     _skipped: bool = False
+    _natural_end: bool = False                       # last track finished on its own
+    _started: float = 0.0                            # monotonic start of current track
+    _paused_at: float = 0.0                          # monotonic time pause began
+    _paused_accum: float = 0.0                       # total paused seconds this track
 
     def __post_init__(self):
         self._lock = threading.RLock()
@@ -111,9 +132,25 @@ class Engine:
             self.queue.append(track)
             self._wake.notify()
 
+    def play_tracks(self, tracks: list, shuffle: bool = False):
+        """Replace the queue with a list (a whole playlist/album) and start it."""
+        tracks = [t for t in tracks if t and t.get("videoId")]
+        if not tracks:
+            return
+        with self._wake:
+            if shuffle:
+                self.shuffle = True
+                tracks = tracks[:]
+                random.shuffle(tracks)
+            self.queue = tracks
+            self.history = []
+            self._interrupt()
+            self._wake.notify()
+
     def skip(self):
         with self._wake:
             self._interrupt()
+            self._wake.notify()
 
     def previous(self):
         with self._wake:
@@ -129,18 +166,50 @@ class Engine:
             if self.current and not self.paused:
                 self._signal_procs(signal.SIGSTOP)
                 self.paused = True
+                self._paused_at = time.monotonic()
 
     def resume(self):
         with self._wake:
             if self.current and self.paused:
                 self._signal_procs(signal.SIGCONT)
                 self.paused = False
+                self._paused_accum += time.monotonic() - self._paused_at
 
     def stop(self):
         with self._wake:
             self.queue.clear()
             self._stop = True
             self._interrupt()
+            self._wake.notify()
+
+    def set_shuffle(self, on: bool):
+        with self._wake:
+            self.shuffle = on
+            if on:
+                random.shuffle(self.queue)
+
+    def set_repeat(self, mode: str):
+        if mode not in ("off", "all", "one"):
+            return
+        with self._wake:
+            self.repeat = mode
+
+    def remove_at(self, index: int):
+        with self._wake:
+            if 0 <= index < len(self.queue):
+                self.queue.pop(index)
+
+    def clear_queue(self):
+        with self._wake:
+            self.queue.clear()
+
+    def _elapsed(self) -> float:
+        if not self.current or self._started == 0.0:
+            return 0.0
+        paused = self._paused_accum
+        if self.paused:
+            paused += time.monotonic() - self._paused_at
+        return max(0.0, time.monotonic() - self._started - paused)
 
     def status(self) -> dict:
         with self._lock:
@@ -149,6 +218,9 @@ class Engine:
                 "paused": self.paused,
                 "queue": list(self.queue),
                 "playing": self.current is not None,
+                "shuffle": self.shuffle,
+                "repeat": self.repeat,
+                "elapsed": round(self._elapsed()),
             }
 
     # -- internals ---------------------------------------------------------- #
@@ -174,20 +246,50 @@ class Engine:
                 except ProcessLookupError:
                     pass
 
+    def _next_track(self) -> Optional[dict]:
+        """Pick the next track to play, honoring repeat/shuffle. Caller holds lock."""
+        # repeat-one: replay the same track, but only if it ended on its own
+        # (an explicit skip/prev/stop should still move on).
+        if self.repeat == "one" and self._natural_end and self.current:
+            return self.current
+        if self.queue:
+            return self.queue.pop(0)
+        if self.repeat == "all" and self.history:
+            self.queue = self.history[:]            # start the list over
+            self.history = []
+            if self.shuffle:
+                random.shuffle(self.queue)
+            return self.queue.pop(0)
+        return None
+
     def _run(self):
         while True:
             with self._wake:
-                while not self.queue:
+                nxt = self._next_track()
+                while nxt is None:
                     self.current = None
                     self._wake.wait()
-                self.current = self.queue.pop(0)
-                self.history.append(self.current)
+                    nxt = self._next_track()
+
+                replaying = (self.repeat == "one" and self._natural_end
+                             and nxt is self.current)
+                self.current = nxt
+                if not replaying:
+                    self.history.append(nxt)
                 self.paused = False
                 self._stop = False
                 self._skipped = False
-                track = self.current
+                self._natural_end = False
+                self._started = time.monotonic()
+                self._paused_at = 0.0
+                self._paused_accum = 0.0
+                track = nxt
 
             self._play_blocking(track)
+
+            with self._wake:
+                # Did the track finish on its own (vs. skip/prev/stop)?
+                self._natural_end = not (self._skipped or self._stop)
 
     def _play_blocking(self, track: dict):
         video_id = track["videoId"]
@@ -257,19 +359,24 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
 @app.get("/api/search")
 def api_search():
     query = request.args.get("q", "").strip()
     if not query:
         return jsonify([])
-    results = ytmusic.search(query, filter="songs", limit=25)
+    results = get_ytmusic().search(query, filter="songs", limit=25)
     return jsonify([t for t in (normalize_track(r) for r in results) if t])
 
 
 @app.get("/api/library")
 def api_library():
     try:
-        songs = ytmusic.get_library_songs(limit=100)
+        songs = get_ytmusic().get_library_songs(limit=100)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"library needs account auth: {exc}"}), 400
     return jsonify([t for t in (normalize_track(s) for s in songs) if t])
@@ -278,7 +385,7 @@ def api_library():
 @app.get("/api/playlists")
 def api_playlists():
     try:
-        pls = ytmusic.get_library_playlists(limit=100)
+        pls = get_ytmusic().get_library_playlists(limit=100)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"playlists need account auth: {exc}"}), 400
     return jsonify([
@@ -293,7 +400,7 @@ def api_playlists():
 
 @app.get("/api/playlist/<playlist_id>")
 def api_playlist(playlist_id):
-    pl = ytmusic.get_playlist(playlist_id, limit=200)
+    pl = get_ytmusic().get_playlist(playlist_id, limit=200)
     tracks = [t for t in (normalize_track(x) for x in pl.get("tracks", [])) if t]
     return jsonify({"title": pl.get("title"), "tracks": tracks})
 
@@ -307,6 +414,40 @@ def api_play():
 @app.post("/api/queue")
 def api_queue():
     engine.enqueue(request.get_json(force=True))
+    return jsonify(engine.status())
+
+
+@app.post("/api/play_tracks")
+def api_play_tracks():
+    body = request.get_json(force=True) or {}
+    engine.play_tracks(body.get("tracks", []), shuffle=bool(body.get("shuffle")))
+    return jsonify(engine.status())
+
+
+@app.post("/api/queue/remove")
+def api_queue_remove():
+    body = request.get_json(force=True) or {}
+    engine.remove_at(int(body.get("index", -1)))
+    return jsonify(engine.status())
+
+
+@app.post("/api/queue/clear")
+def api_queue_clear():
+    engine.clear_queue()
+    return jsonify(engine.status())
+
+
+@app.post("/api/shuffle")
+def api_shuffle():
+    body = request.get_json(force=True) or {}
+    engine.set_shuffle(bool(body.get("on")))
+    return jsonify(engine.status())
+
+
+@app.post("/api/repeat")
+def api_repeat():
+    body = request.get_json(force=True) or {}
+    engine.set_repeat(body.get("mode", "off"))
     return jsonify(engine.status())
 
 

@@ -8,7 +8,7 @@
   :root { --bg:#0f0f14; --card:#1b1b24; --accent:#ff4356; --txt:#f2f2f5; --dim:#9a9aa6; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-         background:var(--bg); color:var(--txt); padding-bottom:90px; }
+         background:var(--bg); color:var(--txt); padding-bottom:150px; }
   header { position:sticky; top:0; background:var(--bg); padding:12px 14px 6px; z-index:5; }
   h1 { font-size:18px; margin:0 0 10px; }
   .tabs { display:flex; gap:8px; margin-bottom:10px; }
@@ -26,14 +26,24 @@
   .meta .a { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .row .q { background:none; border:0; color:var(--dim); font-size:22px; padding:4px 8px; }
   .hint { color:var(--dim); font-size:13px; padding:18px 14px; text-align:center; }
+  .bar { display:flex; gap:8px; padding:4px 12px 8px; }
+  .bar button { flex:1; background:var(--card); color:var(--txt); border:0; padding:10px;
+                border-radius:10px; font-size:14px; }
+  .bar button.ghost { background:none; color:var(--dim); flex:0 0 auto; }
   #player { position:fixed; left:0; right:0; bottom:0; background:var(--card);
             padding:10px 14px calc(10px + env(safe-area-inset-bottom)); display:none; }
   #player.show { display:block; }
-  .np { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .np { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
   .np img { width:42px; height:42px; border-radius:6px; object-fit:cover; }
-  .ctrls { display:flex; justify-content:center; align-items:center; gap:18px; }
-  .ctrls button { background:none; border:0; color:var(--txt); font-size:26px; }
+  .prog { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .prog .time { font-size:11px; color:var(--dim); width:34px; text-align:center; flex:0 0 auto; }
+  .track { flex:1; height:4px; border-radius:2px; background:#33333f; overflow:hidden; }
+  .track > i { display:block; height:100%; width:0; background:var(--accent); }
+  .ctrls { display:flex; justify-content:center; align-items:center; gap:14px; }
+  .ctrls button { background:none; border:0; color:var(--txt); font-size:24px; padding:2px; }
   .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
+  .ctrls .toggle { font-size:18px; color:var(--dim); }
+  .ctrls .toggle.on { color:var(--accent); }
 </style>
 </head>
 <body>
@@ -43,10 +53,12 @@
     <button data-tab="search" class="active">Search</button>
     <button data-tab="library">Library</button>
     <button data-tab="playlists">Playlists</button>
+    <button data-tab="queue">Queue</button>
   </div>
   <input id="search" placeholder="Search YouTube Music…" autocomplete="off" />
 </header>
 
+<div id="actionbar" class="bar" style="display:none"></div>
 <div id="list" class="list"></div>
 
 <div id="player">
@@ -54,10 +66,17 @@
     <img id="np-img" src="" alt="" />
     <div class="meta"><div class="t" id="np-title">—</div><div class="a" id="np-artist"></div></div>
   </div>
+  <div class="prog">
+    <span class="time" id="t-cur">0:00</span>
+    <div class="track"><i id="t-fill"></i></div>
+    <span class="time" id="t-dur">0:00</span>
+  </div>
   <div class="ctrls">
+    <button id="shuffle" class="toggle" title="Shuffle">🔀</button>
     <button id="prev">⏮</button>
     <button id="playpause" class="play">⏸</button>
     <button id="next">⏭</button>
+    <button id="repeat" class="toggle" title="Repeat">🔁</button>
     <button id="stop">⏹</button>
   </div>
 </div>
@@ -65,11 +84,13 @@
 <script>
 const $ = s => document.querySelector(s);
 const listEl = $("#list");
+const actionEl = $("#actionbar");
 let tab = "search";
+let lastTracks = [];   // tracks currently shown (for "Play all" / "Shuffle play")
 
 async function api(path, opts) {
   const r = await fetch("/api/" + path, opts);
-  if (!r.ok) throw new Error((await r.json()).error || r.status);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
   return r.json();
 }
 const post = (path, body) => api(path, {
@@ -77,8 +98,25 @@ const post = (path, body) => api(path, {
   headers: { "Content-Type": "application/json" },
   body: body ? JSON.stringify(body) : null,
 });
+const esc = s => (s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const fmt = s => { s = Math.max(0, s|0); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
+function flash(b){ b.textContent="✓"; setTimeout(()=>b.textContent="＋",700); }
+
+function showActions(buttons) {
+  if (!buttons) { actionEl.style.display = "none"; actionEl.innerHTML = ""; return; }
+  actionEl.style.display = "flex";
+  actionEl.innerHTML = "";
+  buttons.forEach(b => {
+    const el = document.createElement("button");
+    el.textContent = b.label;
+    if (b.ghost) el.className = "ghost";
+    el.onclick = b.onclick;
+    actionEl.appendChild(el);
+  });
+}
 
 function render(tracks, emptyMsg) {
+  lastTracks = tracks;
   if (!tracks.length) { listEl.innerHTML = `<div class="hint">${emptyMsg}</div>`; return; }
   listEl.innerHTML = "";
   tracks.forEach(t => {
@@ -93,8 +131,14 @@ function render(tracks, emptyMsg) {
     listEl.appendChild(row);
   });
 }
-const esc = s => (s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
-function flash(b){ b.textContent="✓"; setTimeout(()=>b.textContent="＋",700); }
+
+// Buttons that play an entire shown list (playlist / library / search results).
+function listPlayActions(tracks) {
+  return [
+    { label: "▶ Play all", onclick: () => post("play_tracks", { tracks, shuffle: false }) },
+    { label: "🔀 Shuffle play", onclick: () => post("play_tracks", { tracks, shuffle: true }) },
+  ];
+}
 
 // --- tabs ---
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
@@ -106,11 +150,20 @@ document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
 });
 
 async function loadTab() {
+  showActions(null);
   listEl.innerHTML = `<div class="hint">Loading…</div>`;
   try {
-    if (tab === "library") render(await api("library"), "Library is empty or needs account auth.");
-    else if (tab === "playlists") renderPlaylists(await api("playlists"));
-    else listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`;
+    if (tab === "library") {
+      const songs = await api("library");
+      render(songs, "Library is empty or needs account auth.");
+      if (songs.length) showActions(listPlayActions(songs));
+    } else if (tab === "playlists") {
+      renderPlaylists(await api("playlists"));
+    } else if (tab === "queue") {
+      renderQueue(await api("status"));
+    } else {
+      listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`;
+    }
   } catch (e) { listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
 }
 
@@ -122,10 +175,35 @@ function renderPlaylists(pls) {
     row.className = "row";
     row.innerHTML = `<img src="${p.thumb || ""}" /><div class="meta"><div class="t">${esc(p.title)}</div></div>`;
     row.onclick = async () => {
+      showActions(null);
       listEl.innerHTML = `<div class="hint">Loading…</div>`;
       const data = await api("playlist/" + p.playlistId);
       render(data.tracks, "Empty playlist.");
+      if (data.tracks.length) {
+        showActions([
+          ...listPlayActions(data.tracks),
+          { label: "↩", ghost: true, onclick: () => loadTab() },
+        ]);
+      }
     };
+    listEl.appendChild(row);
+  });
+}
+
+function renderQueue(s) {
+  showActions(null);
+  const items = s.queue || [];
+  if (!items.length) { listEl.innerHTML = `<div class="hint">Queue is empty. Tap ＋ on a track, or “Play all” a playlist.</div>`; return; }
+  showActions([{ label: "🗑 Clear queue", onclick: async () => renderQueue(await post("queue/clear")) }]);
+  listEl.innerHTML = "";
+  items.forEach((t, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <img src="${t.thumb || ""}" />
+      <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
+      <button class="q">✕</button>`;
+    row.querySelector(".q").onclick = async () => renderQueue(await post("queue/remove", { index: i }));
     listEl.appendChild(row);
   });
 }
@@ -135,10 +213,14 @@ let timer;
 $("#search").addEventListener("input", e => {
   clearTimeout(timer);
   const q = e.target.value.trim();
+  showActions(null);
   if (!q) { listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
   timer = setTimeout(async () => {
-    try { render(await api("search?q=" + encodeURIComponent(q)), "No results."); }
-    catch (err) { listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
+    try {
+      const songs = await api("search?q=" + encodeURIComponent(q));
+      render(songs, "No results.");
+      if (songs.length) showActions(listPlayActions(songs));
+    } catch (err) { listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
   }, 350);
 });
 
@@ -147,12 +229,22 @@ $("#prev").onclick = () => post("prev");
 $("#next").onclick = () => post("next");
 $("#stop").onclick = () => post("stop");
 $("#playpause").onclick = () => post(paused ? "resume" : "pause");
+$("#shuffle").onclick = () => post("shuffle", { on: !shuffle });
+$("#repeat").onclick = () => {
+  const next = { off: "all", all: "one", one: "off" }[repeat] || "off";
+  post("repeat", { mode: next });
+};
 
-let paused = false;
+let paused = false, shuffle = false, repeat = "off";
 async function poll() {
   try {
     const s = await api("status");
     const p = $("#player");
+    shuffle = s.shuffle; repeat = s.repeat;
+    $("#shuffle").classList.toggle("on", shuffle);
+    const rb = $("#repeat");
+    rb.classList.toggle("on", repeat !== "off");
+    rb.textContent = repeat === "one" ? "🔂" : "🔁";
     if (s.current) {
       p.classList.add("show");
       $("#np-title").textContent = s.current.title;
@@ -160,9 +252,14 @@ async function poll() {
       $("#np-img").src = s.current.thumb || "";
       paused = s.paused;
       $("#playpause").textContent = paused ? "▶" : "⏸";
+      const dur = s.current.duration || 0, cur = s.elapsed || 0;
+      $("#t-cur").textContent = fmt(cur);
+      $("#t-dur").textContent = dur ? fmt(dur) : "–:––";
+      $("#t-fill").style.width = dur ? Math.min(100, cur / dur * 100) + "%" : "0%";
     } else {
       p.classList.remove("show");
     }
+    if (tab === "queue") renderQueue(s);   // keep the queue view live
   } catch (e) {}
   setTimeout(poll, 2000);
 }

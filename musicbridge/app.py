@@ -23,13 +23,20 @@ from typing import Optional
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
-from ytmusicapi import YTMusic
+from ytmusicapi import OAuthCredentials, YTMusic
+from ytmusicapi.auth.oauth import RefreshingToken
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
 AUTH_FILE = os.environ.get("YTM_AUTH_FILE", "/data/browser.json")
+# OAuth device-flow token (self-refreshing). Preferred over browser.json because
+# it doesn't go stale. Needs a Google Cloud OAuth client of type "TVs and Limited
+# Input devices" — its id/secret go in the env below.
+OAUTH_FILE = os.environ.get("YTM_OAUTH_FILE", "/data/oauth.json")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 SNAPFIFO = os.environ.get("SNAPFIFO", "/snapfifo/snapfifo")
 PORT = int(os.environ.get("PORT", "8080"))
 # Optional Netscape cookies.txt for yt-dlp, used if present. YouTube increasingly
@@ -48,6 +55,23 @@ _ytmusic: Optional[YTMusic] = None
 _ytmusic_lock = threading.Lock()
 
 
+def oauth_credentials() -> Optional[OAuthCredentials]:
+    """OAuth client creds from env, or None if not configured."""
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+        return OAuthCredentials(client_id=GOOGLE_CLIENT_ID,
+                                client_secret=GOOGLE_CLIENT_SECRET)
+    return None
+
+
+def auth_method() -> str:
+    """Which credential source is active: 'oauth' | 'browser' | 'none'."""
+    if os.path.exists(OAUTH_FILE) and oauth_credentials():
+        return "oauth"
+    if os.path.exists(AUTH_FILE):
+        return "browser"
+    return "none"
+
+
 def get_ytmusic() -> YTMusic:
     """Build the YTMusic client on first use, not at import time.
 
@@ -55,20 +79,34 @@ def get_ytmusic() -> YTMusic:
     import time means a slow/blocked request (e.g. an anti-bot rate limit on the
     host IP) would stop the web server from ever starting — the page would just
     "load forever". Building it lazily keeps the UI responsive no matter what.
+
+    Auth precedence: self-refreshing OAuth token, then browser.json, then
+    unauthenticated (public search only).
     """
     global _ytmusic
     if _ytmusic is None:
         with _ytmusic_lock:
             if _ytmusic is None:
-                if os.path.exists(AUTH_FILE):
+                method = auth_method()
+                if method == "oauth":
+                    print(f"[ytm] using OAuth token from {OAUTH_FILE}", flush=True)
+                    _ytmusic = YTMusic(OAUTH_FILE,
+                                       oauth_credentials=oauth_credentials())
+                elif method == "browser":
                     print(f"[ytm] using account auth from {AUTH_FILE}", flush=True)
                     _ytmusic = YTMusic(AUTH_FILE)
                 else:
-                    print(f"[ytm] no auth file at {AUTH_FILE} — running "
-                          "unauthenticated (public search only, no "
-                          "library/playlists)", flush=True)
+                    print("[ytm] no auth configured — running unauthenticated "
+                          "(public search only, no library/playlists)", flush=True)
                     _ytmusic = YTMusic()
     return _ytmusic
+
+
+def reset_ytmusic():
+    """Drop the cached client so the next call rebuilds with current auth."""
+    global _ytmusic
+    with _ytmusic_lock:
+        _ytmusic = None
 
 
 def normalize_track(item: dict) -> Optional[dict]:
@@ -362,6 +400,74 @@ def index():
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
+
+
+# --- Google account connect (OAuth device flow) ---------------------------- #
+# Single-user app, so one in-flight flow is enough.
+_auth_flow: dict = {}
+_auth_lock = threading.Lock()
+
+
+@app.get("/api/auth/status")
+def api_auth_status():
+    return jsonify({"method": auth_method(),
+                    "configured": oauth_credentials() is not None})
+
+
+@app.post("/api/auth/start")
+def api_auth_start():
+    creds = oauth_credentials()
+    if not creds:
+        return jsonify({"error": "OAuth is not configured. Set GOOGLE_CLIENT_ID "
+                        "and GOOGLE_CLIENT_SECRET (a 'TVs and Limited Input "
+                        "devices' client) in the environment and restart."}), 400
+    try:
+        code = creds.get_code()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"could not start login: {exc}"}), 400
+    with _auth_lock:
+        _auth_flow.clear()
+        _auth_flow["device_code"] = code["device_code"]
+    url = code.get("verification_url", "https://www.google.com/device")
+    return jsonify({
+        "user_code": code.get("user_code"),
+        "verification_url": url,
+        "interval": code.get("interval", 5),
+        "expires_in": code.get("expires_in", 1800),
+    })
+
+
+@app.post("/api/auth/poll")
+def api_auth_poll():
+    creds = oauth_credentials()
+    with _auth_lock:
+        device_code = _auth_flow.get("device_code")
+    if not creds or not device_code:
+        return jsonify({"status": "idle"})
+    try:
+        raw = creds.token_from_code(device_code)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"status": "error", "error": str(exc)})
+    if raw.get("access_token"):
+        token = RefreshingToken(credentials=creds, **raw)
+        token.store_token(OAUTH_FILE)
+        with _auth_lock:
+            _auth_flow.clear()
+        reset_ytmusic()
+        print(f"[ytm] OAuth token stored at {OAUTH_FILE}", flush=True)
+        return jsonify({"status": "connected"})
+    err = raw.get("error")
+    if err in ("authorization_pending", "slow_down"):
+        return jsonify({"status": "pending"})
+    return jsonify({"status": "error", "error": err or "unknown error"})
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    if os.path.exists(OAUTH_FILE):
+        os.remove(OAUTH_FILE)
+    reset_ytmusic()
+    return jsonify({"method": auth_method()})
 
 
 @app.get("/api/search")

@@ -44,11 +44,28 @@
   .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
   .ctrls .toggle { font-size:18px; color:var(--dim); }
   .ctrls .toggle.on { color:var(--accent); }
+  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .top h1 { margin:0; }
+  .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
+  .acct.ok { color:#4ade80; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
+           align-items:center; justify-content:center; z-index:20; padding:20px; }
+  .modal.show { display:flex; }
+  .sheet { background:var(--card); border-radius:14px; padding:20px; max-width:360px; width:100%; }
+  .sheet h2 { margin:0 0 10px; font-size:17px; }
+  .sheet p { color:var(--dim); font-size:13px; line-height:1.5; margin:8px 0; }
+  .sheet b { color:var(--txt); }
+  .code { font-size:30px; letter-spacing:4px; text-align:center; font-weight:700;
+          background:var(--bg); padding:14px; border-radius:10px; margin:12px 0; }
+  .sheet a.btn, .sheet button.btn { display:block; width:100%; text-align:center; box-sizing:border-box;
+        background:var(--accent); color:#fff; border:0; border-radius:10px; padding:12px;
+        font-size:15px; text-decoration:none; margin-top:8px; }
+  .sheet button.sec { background:none; color:var(--dim); }
 </style>
 </head>
 <body>
 <header>
-  <h1>🎵 Multiroom</h1>
+  <div class="top"><h1>🎵 Multiroom</h1><button id="account" class="acct">Account</button></div>
   <div class="tabs">
     <button data-tab="search" class="active">Search</button>
     <button data-tab="library">Library</button>
@@ -80,6 +97,8 @@
     <button id="stop">⏹</button>
   </div>
 </div>
+
+<div id="authModal" class="modal"><div class="sheet" id="authSheet"></div></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -263,6 +282,86 @@ async function poll() {
   } catch (e) {}
   setTimeout(poll, 2000);
 }
+// --- account / Google login (OAuth device flow) ---
+const authBtn = $("#account"), authModal = $("#authModal"), authSheet = $("#authSheet");
+let authMethod = "none", authConfigured = false, pollTimer = null;
+
+async function refreshAuth() {
+  try {
+    const s = await api("auth/status");
+    authMethod = s.method; authConfigured = s.configured;
+    authBtn.textContent = authMethod === "none" ? "Connect" : "Account";
+    authBtn.classList.toggle("ok", authMethod !== "none");
+  } catch (e) {}
+}
+
+function closeAuth() {
+  authModal.classList.remove("show");
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+function bindClose() { const c = $("#closeAuth"); if (c) c.onclick = closeAuth; }
+authBtn.onclick = () => { renderAuth(); authModal.classList.add("show"); };
+authModal.onclick = e => { if (e.target === authModal) closeAuth(); };
+
+function renderAuth() {
+  if (authMethod === "oauth") {
+    authSheet.innerHTML = `<h2>Account connected</h2>
+      <p>Signed in with your Google account. Library &amp; playlists use this token, which refreshes itself.</p>
+      <button class="btn" id="logout">Disconnect</button>
+      <button class="btn sec" id="closeAuth">Close</button>`;
+    $("#logout").onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); loadTab(); };
+  } else if (!authConfigured) {
+    authSheet.innerHTML = `<h2>Login not configured</h2>
+      <p>Set <b>GOOGLE_CLIENT_ID</b> and <b>GOOGLE_CLIENT_SECRET</b> (a “TVs and Limited Input
+      devices” OAuth client) in the server environment and restart.
+      ${authMethod === "browser" ? "A browser.json is currently in use." : ""}</p>
+      <button class="btn sec" id="closeAuth">Close</button>`;
+  } else {
+    authSheet.innerHTML = `<h2>Connect Google account</h2>
+      <p>Log in once with your real Google account. The token refreshes itself, so you won’t have to redo this.</p>
+      <button class="btn" id="startAuth">Start login</button>
+      <button class="btn sec" id="closeAuth">Close</button>`;
+    $("#startAuth").onclick = startAuth;
+  }
+  bindClose();
+}
+
+async function startAuth() {
+  authSheet.innerHTML = `<p>Starting…</p>`;
+  let d;
+  try { d = await post("auth/start"); }
+  catch (e) {
+    authSheet.innerHTML = `<h2>Couldn’t start</h2><p>${esc(e.message)}</p>
+      <button class="btn sec" id="closeAuth">Close</button>`;
+    bindClose(); return;
+  }
+  const host = (d.verification_url || "").replace(/^https?:\/\//, "");
+  authSheet.innerHTML = `<h2>Sign in to Google</h2>
+    <p>Open the link below and enter this code:</p>
+    <div class="code">${esc(d.user_code || "")}</div>
+    <a class="btn" href="${esc(d.verification_url)}" target="_blank" rel="noopener">Open ${esc(host)}</a>
+    <p id="authState">Waiting for approval…</p>
+    <button class="btn sec" id="closeAuth">Close</button>`;
+  bindClose();
+  const interval = Math.max(2, d.interval || 5) * 1000;
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    let r;
+    try { r = await post("auth/poll"); } catch (e) { return; }
+    const st = $("#authState");
+    if (r.status === "connected") {
+      clearInterval(pollTimer); pollTimer = null;
+      if (st) st.textContent = "Connected! 🎉";
+      await refreshAuth();
+      setTimeout(() => { closeAuth(); loadTab(); }, 1200);
+    } else if (r.status === "error") {
+      clearInterval(pollTimer); pollTimer = null;
+      if (st) st.textContent = "Error: " + (r.error || "unknown");
+    }
+  }, interval);
+}
+
+refreshAuth();
 poll();
 loadTab();
 </script>

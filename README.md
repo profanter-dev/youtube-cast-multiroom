@@ -55,26 +55,34 @@ single `$` as a variable). Example: `$2y$05$abc…` becomes `$$2y$$05$$abc…`.
 
 ### 2. Connect your YouTube Music account (one-time)
 
-`musicbridge` reads an `ytmusicapi` **browser auth** file. Create it once and drop it
-in the data dir:
+Library and Playlists need your Google account. The easiest, most durable way is
+**Sign in with Google** right from the web UI's **Account** button — it uses a
+self-refreshing OAuth token, so you never have to re-capture cookies.
 
-```bash
-pip install ytmusicapi          # on any machine
-ytmusicapi browser              # paste request headers from music.youtube.com — see below
-```
+It needs a free, one-time OAuth client (Google retired the shared one):
 
-To get the headers: open <https://music.youtube.com> logged in → DevTools (F12) →
-Network tab → click any `/youtubei/...` POST request → copy the **request headers**
-and paste them when prompted. This writes `browser.json`. Copy it to the host:
+1. Go to <https://console.cloud.google.com/> → create a project (any name).
+2. **APIs & Services → Library** → enable **YouTube Data API v3**.
+3. **APIs & Services → OAuth consent screen** → choose **External**, fill the
+   required fields, and add **your own Google account** under *Test users*.
+4. **APIs & Services → Credentials → Create credentials → OAuth client ID** →
+   application type **TVs and Limited Input devices**. Copy the **Client ID** and
+   **Client secret**.
+5. Put them in `.env`:
+   ```bash
+   GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=xxxx
+   ```
+6. `docker compose up -d musicbridge`, open the web UI, tap **Account → Start
+   login**, open the shown link, enter the code, approve. Done — the token is
+   stored at `$DATA_DIR/musicbridge/oauth.json` and refreshes itself.
 
-```bash
-mkdir -p "$DATA_DIR/musicbridge"
-cp browser.json "$DATA_DIR/musicbridge/browser.json"
-```
+Without this, musicbridge still works for **public search**; the Library/Playlists
+tabs just stay empty.
 
-These credentials stay valid as long as your YouTube Music session does (~2 years,
-unless you log out). Without this file, musicbridge still works for **public search**,
-but the Library/Playlists tabs stay empty.
+> **Alternative (no Google Cloud setup):** drop an `ytmusicapi` **browser auth**
+> file at `$DATA_DIR/musicbridge/browser.json` instead. It works but the session
+> cookies go stale every few weeks and must be recaptured — OAuth is preferred.
 
 ### 3. Start
 
@@ -113,7 +121,9 @@ docker compose build musicbridge && docker compose up -d musicbridge
 
 | Variable | Description |
 |---|---|
-| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/browser.json`). |
+| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/oauth.json`, optional `cookies.txt`). |
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | `htpasswd` `user:hash` for the web UI (double every `$`). |
+| `GOOGLE_CLIENT_ID` | OAuth client ID for Google login (optional; "TVs and Limited Input devices"). |
+| `GOOGLE_CLIENT_SECRET` | OAuth client secret matching `GOOGLE_CLIENT_ID`. |

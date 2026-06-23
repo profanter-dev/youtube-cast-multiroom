@@ -122,3 +122,4 @@ docker compose build musicbridge && docker compose up -d musicbridge
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | `htpasswd` `user:hash` for the web UI (double every `$`). |
+| `SNAPSERVER_CONTROL` | Snapcast control `host:port` for the Volume panel (default `snapserver:1705`). |

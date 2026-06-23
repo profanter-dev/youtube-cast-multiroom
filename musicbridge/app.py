@@ -12,10 +12,12 @@ ffmpeg, and write that into the same FIFO Snapcast already reads from.
 Control surface: a password-protected web UI (Traefik basic-auth in front).
 """
 
+import itertools
 import json
 import os
 import random
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -41,6 +43,9 @@ PORT = int(os.environ.get("PORT", "8080"))
 # Uploaded through the web UI's Account button.
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "/data/cookies.txt")
 YTM_ORIGIN = "https://music.youtube.com"
+# Snapcast JSON-RPC control endpoint (host:port). Reachable over the Docker
+# network by the snapserver container name.
+SNAPSERVER_CONTROL = os.environ.get("SNAPSERVER_CONTROL", "snapserver:1705")
 
 # yt-dlp tuning. Leave the player client to yt-dlp's own auto-fallback (it lands
 # on android_vr, which serves plain audio without a JS runtime / PO token);
@@ -619,6 +624,97 @@ def api_repeat():
     body = request.get_json(force=True) or {}
     engine.set_repeat(body.get("mode", "off"))
     return jsonify(engine.status())
+
+
+# --------------------------------------------------------------------------- #
+# Snapcast per-room volume (JSON-RPC over the control port)
+# --------------------------------------------------------------------------- #
+
+_rpc_id = itertools.count(1)
+
+
+def snap_rpc(method: str, params: Optional[dict] = None, timeout: float = 4.0):
+    """One JSON-RPC call to snapserver's control port; returns the result."""
+    host, _, port = SNAPSERVER_CONTROL.partition(":")
+    req_id = next(_rpc_id)
+    req = {"id": req_id, "jsonrpc": "2.0", "method": method}
+    if params is not None:
+        req["params"] = params
+    with socket.create_connection((host, int(port or 1705)), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall((json.dumps(req) + "\r\n").encode())
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("snapserver closed the connection")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                # skip async notifications, wait for our matching response
+                if msg.get("id") == req_id:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"])
+                    return msg.get("result")
+
+
+def snap_clients() -> list:
+    """Flatten Server.GetStatus into a list of clients with volume."""
+    status = snap_rpc("Server.GetStatus")
+    out = []
+    for group in status.get("server", {}).get("groups", []):
+        for c in group.get("clients", []):
+            cfg = c.get("config", {})
+            vol = cfg.get("volume", {})
+            out.append({
+                "id": c.get("id"),
+                "name": cfg.get("name") or c.get("host", {}).get("name") or "Speaker",
+                "percent": vol.get("percent", 0),
+                "muted": vol.get("muted", False),
+                "connected": c.get("connected", False),
+            })
+    return out
+
+
+@app.get("/api/snapcast/clients")
+def api_snap_clients():
+    try:
+        return jsonify(snap_clients())
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"snapserver unreachable: {exc}"}), 502
+
+
+@app.post("/api/snapcast/volume")
+def api_snap_volume():
+    body = request.get_json(force=True) or {}
+    percent = max(0, min(100, int(body.get("percent", 0))))
+    try:
+        snap_rpc("Client.SetVolume", {"id": body.get("id"),
+                 "volume": {"muted": bool(body.get("muted", False)), "percent": percent}})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 502
+    return jsonify({"ok": True})
+
+
+@app.post("/api/snapcast/volume_all")
+def api_snap_volume_all():
+    body = request.get_json(force=True) or {}
+    percent = max(0, min(100, int(body.get("percent", 0))))
+    try:
+        for c in snap_clients():
+            if c["connected"]:
+                snap_rpc("Client.SetVolume", {"id": c["id"],
+                         "volume": {"muted": False, "percent": percent}})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 502
+    return jsonify({"ok": True})
 
 
 @app.post("/api/<action>")

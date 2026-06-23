@@ -59,6 +59,13 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
   .top h1 { margin:0; }
+  .hdr-btns { display:flex; gap:8px; flex:0 0 auto; }
+  .vrow { display:flex; align-items:center; gap:10px; margin:12px 0; }
+  .vrow .vn { flex:0 0 96px; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .vrow input[type=range] { flex:1; accent-color:var(--accent); min-width:0; }
+  .vrow .vp { flex:0 0 38px; text-align:right; font-size:12px; color:var(--dim); }
+  .vrow.off { opacity:.4; }
+  .vhr { border:0; border-top:1px solid #2a2a35; margin:14px 0; }
   .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
   .acct.ok { color:#4ade80; }
   .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
@@ -78,7 +85,7 @@
 </head>
 <body>
 <header>
-  <div class="top"><h1><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:7px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Multiroom</h1><button id="account" class="acct">Account</button></div>
+  <div class="top"><h1><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:7px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Multiroom</h1><div class="hdr-btns"><button id="volume" class="acct">Volume</button><button id="account" class="acct">Account</button></div></div>
   <div class="tabs">
     <button data-tab="search" class="active">Search</button>
     <button data-tab="library">Liked</button>
@@ -112,6 +119,7 @@
 </div>
 
 <div id="authModal" class="modal"><div class="sheet" id="authSheet"></div></div>
+<div id="volModal" class="modal"><div class="sheet" id="volSheet"></div></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -464,6 +472,56 @@ async function uploadCookie(e) {
       + "Re-export while logged in to music.youtube.com.";
     await refreshAuth();
   }
+}
+
+// --- per-room volume (Snapcast) ---
+const volBtn = $("#volume"), volModal = $("#volModal"), volSheet = $("#volSheet");
+volBtn.onclick = openVol;
+volModal.onclick = e => { if (e.target === volModal) volModal.classList.remove("show"); };
+
+async function openVol() {
+  volModal.classList.add("show");
+  volSheet.innerHTML = `<h2>Volume</h2><p>Loading rooms…</p>`;
+  try {
+    renderVol(await api("snapcast/clients"));
+  } catch (e) {
+    volSheet.innerHTML = `<h2>Volume</h2><p>${esc(e.message)}</p>
+      <button class="btn sec" id="volClose">Close</button>`;
+    $("#volClose").onclick = () => volModal.classList.remove("show");
+  }
+}
+
+function renderVol(clients) {
+  const on = clients.filter(c => c.connected);
+  const avg = on.length ? Math.round(on.reduce((a, c) => a + c.percent, 0) / on.length) : 50;
+  let html = `<h2>Volume</h2>
+    <div class="vrow"><span class="vn"><b>All rooms</b></span>
+      <input type="range" min="0" max="100" value="${avg}" id="vAll">
+      <span class="vp" id="vAllP">${avg}%</span></div><hr class="vhr">`;
+  if (!clients.length) html += `<p>No Snapcast clients connected.</p>`;
+  clients.forEach((c, i) => {
+    html += `<div class="vrow ${c.connected ? "" : "off"}" data-i="${i}">
+      <span class="vn">${esc(c.name)}</span>
+      <input type="range" min="0" max="100" value="${c.percent}" ${c.connected ? "" : "disabled"}>
+      <span class="vp">${c.percent}%</span></div>`;
+  });
+  html += `<button class="btn sec" id="volClose">Close</button>`;
+  volSheet.innerHTML = html;
+  $("#volClose").onclick = () => volModal.classList.remove("show");
+
+  const rows = [...volSheet.querySelectorAll(".vrow[data-i]")];
+  const all = $("#vAll");
+  all.oninput = () => {
+    $("#vAllP").textContent = all.value + "%";
+    rows.forEach(r => { const inp = r.querySelector("input"); if (!inp.disabled) {
+      inp.value = all.value; r.querySelector(".vp").textContent = all.value + "%"; } });
+  };
+  all.onchange = () => post("snapcast/volume_all", { percent: +all.value }).catch(() => {});
+  rows.forEach(r => {
+    const c = clients[+r.dataset.i], inp = r.querySelector("input"), lbl = r.querySelector(".vp");
+    inp.oninput = () => { lbl.textContent = inp.value + "%"; };
+    inp.onchange = () => post("snapcast/volume", { id: c.id, percent: +inp.value }).catch(() => {});
+  });
 }
 
 refreshAuth();

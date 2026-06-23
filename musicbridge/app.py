@@ -45,10 +45,15 @@ YTM_ORIGIN = "https://music.youtube.com"
 # yt-dlp tuning. Leave the player client to yt-dlp's own auto-fallback (it lands
 # on android_vr, which serves plain audio without a JS runtime / PO token);
 # forcing a client list can exclude the one that actually works. `bestaudio/best`
-# falls back to a combined stream if no audio-only format is offered. Both
-# overridable via env if YouTube shifts again (e.g. YTDLP_PLAYER_CLIENT=tv).
+# falls back to a combined stream if no audio-only format is offered.
 YTDLP_FORMAT = os.environ.get("YTDLP_FORMAT", "bestaudio/best")
 YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "")
+# Crucial: a *logged-in* cookie makes YouTube force SABR streaming and skip the
+# android_vr client, leaving NO downloadable audio (yt-dlp issue #12482).
+# Anonymous extraction uses android_vr and works, so by default we do NOT hand
+# the cookie to yt-dlp (it's still used for the ytmusicapi account side). Flip to
+# 1 only if extraction starts failing with "confirm you're not a bot".
+YTDLP_USE_COOKIES = os.environ.get("YTDLP_USE_COOKIES", "0") == "1"
 
 # Snapcast stream format — MUST match snapserver.conf (sampleformat=48000:16:2).
 SAMPLE_RATE = "48000"
@@ -390,7 +395,7 @@ class Engine:
         if YTDLP_PLAYER_CLIENT:
             ytdlp_cmd += ["--extractor-args",
                           f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
-        if os.path.exists(COOKIES_FILE):
+        if YTDLP_USE_COOKIES and os.path.exists(COOKIES_FILE):
             ytdlp_cmd += ["--cookies", COOKIES_FILE]
         ytdlp_cmd.append(url)
 
@@ -607,11 +612,12 @@ def api_status():
 
 if __name__ == "__main__":
     if os.path.exists(COOKIES_FILE):
-        print(f"[ytdlp] using cookies from {COOKIES_FILE}")
-        # Keep browser.json in sync with the (possibly refreshed) cookie.
+        # Keep browser.json (account auth) in sync with the uploaded cookie.
         build_browser_json()
+        print(f"[ytdlp] yt-dlp cookies: {'on' if YTDLP_USE_COOKIES else 'off'} "
+              "(off avoids YouTube's SABR gating; cookie still powers the account)")
     else:
-        print(f"[ytdlp] no cookies file at {COOKIES_FILE} — upload one via the "
-              "Account button (powers both playback and library/playlists)")
+        print(f"[ytdlp] no cookie at {COOKIES_FILE} — upload one via the Account "
+              "button for library/playlists")
     print(f"[musicbridge] serving on :{PORT}, FIFO={SNAPFIFO}")
     serve(app, host="0.0.0.0", port=PORT, threads=8)

@@ -257,6 +257,19 @@ $("#repeat").onclick = () => {
 };
 
 let paused = false, shuffle = false, repeat = "off";
+let playing = false, npDur = 0, npElapsed = 0, npSyncAt = 0;
+
+// Tick the clock locally between 2s polls so the time/bar move smoothly.
+function renderProgress() {
+  if (!playing) return;
+  let cur = npElapsed;
+  if (!paused) cur += (Date.now() - npSyncAt) / 1000;
+  if (npDur) cur = Math.min(cur, npDur);
+  $("#t-cur").textContent = fmt(cur);
+  $("#t-fill").style.width = npDur ? Math.min(100, cur / npDur * 100) + "%" : "0%";
+}
+setInterval(renderProgress, 500);
+
 async function poll() {
   try {
     const s = await api("status");
@@ -266,6 +279,7 @@ async function poll() {
     const rb = $("#repeat");
     rb.classList.toggle("on", repeat !== "off");
     rb.textContent = repeat === "one" ? "🔂" : "🔁";
+    playing = !!s.current;
     if (s.current) {
       p.classList.add("show");
       $("#np-title").textContent = s.current.title;
@@ -273,10 +287,11 @@ async function poll() {
       $("#np-img").src = s.current.thumb || "";
       paused = s.paused;
       $("#playpause").textContent = paused ? "▶" : "⏸";
-      const dur = s.current.duration || 0, cur = s.elapsed || 0;
-      $("#t-cur").textContent = fmt(cur);
-      $("#t-dur").textContent = dur ? fmt(dur) : "–:––";
-      $("#t-fill").style.width = dur ? Math.min(100, cur / dur * 100) + "%" : "0%";
+      npDur = s.current.duration || 0;
+      npElapsed = s.elapsed || 0;       // re-sync to the server's truth
+      npSyncAt = Date.now();
+      $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
+      renderProgress();
     } else {
       p.classList.remove("show");
     }

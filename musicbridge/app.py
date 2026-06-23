@@ -453,7 +453,14 @@ def api_auth_poll():
         except Exception as exc:  # noqa: BLE001
             return jsonify({"status": "error", "error": str(exc)})
         if raw.get("access_token"):
-            token = RefreshingToken(credentials=creds, **raw)
+            # Google adds fields (e.g. refresh_token_expires_in) that
+            # RefreshingToken's constructor rejects, so keep only what it wants.
+            allowed = {"access_token", "refresh_token", "scope",
+                       "token_type", "expires_in"}
+            token = RefreshingToken(
+                credentials=creds,
+                **{k: v for k, v in raw.items() if k in allowed},
+            )
             token.store_token(OAUTH_FILE)
             _auth_flow.clear()
             reset_ytmusic()

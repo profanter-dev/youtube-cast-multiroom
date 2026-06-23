@@ -77,12 +77,15 @@ It needs a free, one-time OAuth client (Google retired the shared one):
    login**, open the shown link, enter the code, approve. Done — the token is
    stored at `$DATA_DIR/musicbridge/oauth.json` and refreshes itself.
 
-Without this, musicbridge still works for **public search**; the Library/Playlists
-tabs just stay empty.
+**What the login powers:** your **Playlists** and **Liked** music come from the
+official **YouTube Data API v3** using this OAuth token (stable + self-refreshing).
+**Search** is public and needs no login. Playback always uses yt-dlp (+ optional
+`cookies.txt`). Note the YTM-only "songs added to library" bucket isn't exposed by
+the official API — the Liked tab covers your liked tracks instead.
 
-> **Alternative (no Google Cloud setup):** drop an `ytmusicapi` **browser auth**
-> file at `$DATA_DIR/musicbridge/browser.json` instead. It works but the session
-> cookies go stale every few weeks and must be recaptured — OAuth is preferred.
+> Why not `ytmusicapi`'s own auth for the library? Its OAuth path currently 400s
+> server-side (a YouTube change), and browser-cookie auth goes stale. Going
+> straight to the official Data API for playlists/liked sidesteps both.
 
 ### 3. Start
 

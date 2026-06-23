@@ -68,7 +68,7 @@
   <div class="top"><h1>🎵 Multiroom</h1><button id="account" class="acct">Account</button></div>
   <div class="tabs">
     <button data-tab="search" class="active">Search</button>
-    <button data-tab="library">Library</button>
+    <button data-tab="library">Liked</button>
     <button data-tab="playlists">Playlists</button>
     <button data-tab="queue">Queue</button>
   </div>
@@ -174,7 +174,7 @@ async function loadTab() {
   try {
     if (tab === "library") {
       const songs = await api("library");
-      render(songs, "Library is empty or needs account auth.");
+      render(songs, "No liked music yet — or connect your account via the Account button.");
       if (songs.length) showActions(listPlayActions(songs));
     } else if (tab === "playlists") {
       renderPlaylists(await api("playlists"));
@@ -187,7 +187,7 @@ async function loadTab() {
 }
 
 function renderPlaylists(pls) {
-  if (!pls.length) { listEl.innerHTML = `<div class="hint">No playlists (needs account auth).</div>`; return; }
+  if (!pls.length) { listEl.innerHTML = `<div class="hint">No playlists — connect your account via the Account button.</div>`; return; }
   listEl.innerHTML = "";
   pls.forEach(p => {
     const row = document.createElement("div");

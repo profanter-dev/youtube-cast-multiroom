@@ -12,8 +12,10 @@ ffmpeg, and write that into the same FIFO Snapcast already reads from.
 Control surface: a password-protected web UI (Traefik basic-auth in front).
 """
 
+import json
 import os
 import random
+import re
 import signal
 import subprocess
 import threading
@@ -21,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
 from ytmusicapi import OAuthCredentials, YTMusic
@@ -51,6 +54,9 @@ CHANNELS = "2"
 # YouTube Music account (lazy — never block server startup on a network call)
 # --------------------------------------------------------------------------- #
 
+# ytmusicapi is used ONLY for public search. Its authenticated/InnerTube calls
+# are unreliable (OAuth 400s server-side, cookies go stale), so anything
+# account-specific goes through the official YouTube Data API below instead.
 _ytmusic: Optional[YTMusic] = None
 _ytmusic_lock = threading.Lock()
 
@@ -64,53 +70,25 @@ def oauth_credentials() -> Optional[OAuthCredentials]:
 
 
 def auth_method() -> str:
-    """Which credential source is active: 'oauth' | 'browser' | 'none'."""
+    """Account auth state for the UI: 'oauth' (connected) | 'none'."""
     if os.path.exists(OAUTH_FILE) and oauth_credentials():
         return "oauth"
-    if os.path.exists(AUTH_FILE):
-        return "browser"
     return "none"
 
 
 def get_ytmusic() -> YTMusic:
-    """Build the YTMusic client on first use, not at import time.
-
-    The YTMusic() constructor makes a network request to YouTube. Doing that at
-    import time means a slow/blocked request (e.g. an anti-bot rate limit on the
-    host IP) would stop the web server from ever starting — the page would just
-    "load forever". Building it lazily keeps the UI responsive no matter what.
-
-    Auth precedence: self-refreshing OAuth token, then browser.json, then
-    unauthenticated (public search only).
-    """
+    """Unauthenticated ytmusicapi client (public search only), built lazily so a
+    slow YouTube request can never block server startup."""
     global _ytmusic
     if _ytmusic is None:
         with _ytmusic_lock:
             if _ytmusic is None:
-                method = auth_method()
-                if method == "oauth":
-                    print(f"[ytm] using OAuth token from {OAUTH_FILE}", flush=True)
-                    _ytmusic = YTMusic(OAUTH_FILE,
-                                       oauth_credentials=oauth_credentials())
-                elif method == "browser":
-                    print(f"[ytm] using account auth from {AUTH_FILE}", flush=True)
-                    _ytmusic = YTMusic(AUTH_FILE)
-                else:
-                    print("[ytm] no auth configured — running unauthenticated "
-                          "(public search only, no library/playlists)", flush=True)
-                    _ytmusic = YTMusic()
+                _ytmusic = YTMusic()
     return _ytmusic
 
 
-def reset_ytmusic():
-    """Drop the cached client so the next call rebuilds with current auth."""
-    global _ytmusic
-    with _ytmusic_lock:
-        _ytmusic = None
-
-
 def normalize_track(item: dict) -> Optional[dict]:
-    """Reduce a ytmusicapi result to the fields the UI and player need."""
+    """Reduce a ytmusicapi search result to the fields the UI/player need."""
     video_id = item.get("videoId")
     if not video_id:
         return None
@@ -127,6 +105,116 @@ def normalize_track(item: dict) -> Optional[dict]:
         "thumb": thumb,
         "duration": item.get("duration_seconds"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# YouTube Data API v3 — the user's playlists & liked music (official, stable)
+# --------------------------------------------------------------------------- #
+
+DATA_API = "https://www.googleapis.com/youtube/v3"
+_token_lock = threading.Lock()
+
+
+class DataAPIError(Exception):
+    pass
+
+
+def get_access_token() -> Optional[str]:
+    """A valid OAuth access token for the Data API, refreshing if near expiry."""
+    creds = oauth_credentials()
+    if not creds or not os.path.exists(OAUTH_FILE):
+        return None
+    with _token_lock:
+        with open(OAUTH_FILE) as f:
+            tok = json.load(f)
+        if tok.get("expires_at", 0) - time.time() < 120:
+            refreshed = creds.refresh_token(tok["refresh_token"])
+            tok["access_token"] = refreshed["access_token"]
+            tok["expires_in"] = refreshed.get("expires_in", 3600)
+            tok["expires_at"] = int(time.time()) + tok["expires_in"]
+            if refreshed.get("refresh_token"):
+                tok["refresh_token"] = refreshed["refresh_token"]
+            with open(OAUTH_FILE, "w") as f:
+                json.dump(tok, f)
+        return tok.get("access_token")
+
+
+def yt_api(path: str, params: dict) -> dict:
+    token = get_access_token()
+    if not token:
+        raise DataAPIError("not connected — sign in on the Account page")
+    r = requests.get(f"{DATA_API}/{path}", params=params,
+                     headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    if r.status_code != 200:
+        raise DataAPIError(f"Data API {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def iso8601_to_seconds(s: Optional[str]) -> Optional[int]:
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", s or "")
+    if not m:
+        return None
+    h, mi, se = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def _thumb(thumbs: dict) -> Optional[str]:
+    for k in ("maxres", "standard", "high", "medium", "default"):
+        if thumbs and k in thumbs:
+            return thumbs[k]["url"]
+    return None
+
+
+def _clean_artist(name: str) -> str:
+    return (name or "").removesuffix(" - Topic")
+
+
+def track_from_playlist_item(item: dict, durations: dict) -> Optional[dict]:
+    sn = item.get("snippet", {})
+    vid = item.get("contentDetails", {}).get("videoId")
+    title = sn.get("title")
+    if not vid or title in ("Deleted video", "Private video"):
+        return None
+    return {
+        "videoId": vid,
+        "title": title or "Unknown",
+        "artist": _clean_artist(sn.get("videoOwnerChannelTitle", "")),
+        "album": None,
+        "thumb": _thumb(sn.get("thumbnails", {})),
+        "duration": durations.get(vid),
+    }
+
+
+def track_from_video(item: dict) -> Optional[dict]:
+    vid = item.get("id")
+    if not vid:
+        return None
+    sn = item.get("snippet", {})
+    return {
+        "videoId": vid,
+        "title": sn.get("title", "Unknown"),
+        "artist": _clean_artist(sn.get("channelTitle", "")),
+        "album": None,
+        "thumb": _thumb(sn.get("thumbnails", {})),
+        "duration": iso8601_to_seconds(item.get("contentDetails", {}).get("duration")),
+    }
+
+
+def fetch_durations(video_ids: list) -> dict:
+    """videos.list in batches of 50 → {videoId: seconds}, best-effort."""
+    out: dict = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = [v for v in video_ids[i:i + 50] if v]
+        if not chunk:
+            continue
+        try:
+            data = yt_api("videos", {"part": "contentDetails", "id": ",".join(chunk)})
+        except DataAPIError:
+            break
+        for it in data.get("items", []):
+            out[it["id"]] = iso8601_to_seconds(
+                it.get("contentDetails", {}).get("duration"))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -494,34 +582,67 @@ def api_search():
 
 @app.get("/api/library")
 def api_library():
+    """The 'Library' tab shows your Liked Music (videos you've liked)."""
     try:
-        songs = get_ytmusic().get_library_songs(limit=100)
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"library needs account auth: {exc}"}), 400
-    return jsonify([t for t in (normalize_track(s) for s in songs) if t])
+        tracks, page = [], None
+        while len(tracks) < 100:
+            params = {"part": "snippet,contentDetails", "myRating": "like",
+                      "maxResults": 50}
+            if page:
+                params["pageToken"] = page
+            data = yt_api("videos", params)
+            tracks += [t for t in (track_from_video(i) for i in data.get("items", [])) if t]
+            page = data.get("nextPageToken")
+            if not page:
+                break
+        return jsonify(tracks)
+    except DataAPIError as exc:
+        return jsonify({"error": f"Liked music: {exc}"}), 400
 
 
 @app.get("/api/playlists")
 def api_playlists():
     try:
-        pls = get_ytmusic().get_library_playlists(limit=100)
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"playlists need account auth: {exc}"}), 400
-    return jsonify([
-        {
-            "playlistId": p.get("playlistId"),
-            "title": p.get("title"),
-            "thumb": (p.get("thumbnails") or [{}])[-1].get("url"),
-        }
-        for p in pls if p.get("playlistId")
-    ])
+        out, page = [], None
+        while True:
+            params = {"part": "snippet", "mine": "true", "maxResults": 50}
+            if page:
+                params["pageToken"] = page
+            data = yt_api("playlists", params)
+            for p in data.get("items", []):
+                out.append({
+                    "playlistId": p["id"],
+                    "title": p.get("snippet", {}).get("title"),
+                    "thumb": _thumb(p.get("snippet", {}).get("thumbnails", {})),
+                })
+            page = data.get("nextPageToken")
+            if not page:
+                break
+        return jsonify(out)
+    except DataAPIError as exc:
+        return jsonify({"error": f"Playlists: {exc}"}), 400
 
 
 @app.get("/api/playlist/<playlist_id>")
 def api_playlist(playlist_id):
-    pl = get_ytmusic().get_playlist(playlist_id, limit=200)
-    tracks = [t for t in (normalize_track(x) for x in pl.get("tracks", [])) if t]
-    return jsonify({"title": pl.get("title"), "tracks": tracks})
+    try:
+        items, page = [], None
+        while len(items) < 200:
+            params = {"part": "snippet,contentDetails",
+                      "playlistId": playlist_id, "maxResults": 50}
+            if page:
+                params["pageToken"] = page
+            data = yt_api("playlistItems", params)
+            items += data.get("items", [])
+            page = data.get("nextPageToken")
+            if not page:
+                break
+        durations = fetch_durations(
+            [i.get("contentDetails", {}).get("videoId") for i in items])
+        tracks = [t for t in (track_from_playlist_item(i, durations) for i in items) if t]
+        return jsonify({"title": "", "tracks": tracks})
+    except DataAPIError as exc:
+        return jsonify({"error": f"Playlist: {exc}"}), 400
 
 
 @app.post("/api/play")

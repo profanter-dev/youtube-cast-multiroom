@@ -199,6 +199,7 @@ class Engine:
     paused: bool = False
     shuffle: bool = False
     repeat: str = "off"                              # "off" | "all" | "one"
+    loading: bool = False                            # track picked but no audio yet
     _ytdlp: Optional[subprocess.Popen] = None
     _ffmpeg: Optional[subprocess.Popen] = None
     _stop: bool = False
@@ -315,6 +316,7 @@ class Engine:
                 "playing": self.current is not None,
                 "shuffle": self.shuffle,
                 "repeat": self.repeat,
+                "loading": self.loading,
                 "elapsed": round(self._elapsed(), 1),
             }
 
@@ -363,6 +365,7 @@ class Engine:
                 nxt = self._next_track()
                 while nxt is None:
                     self.current = None
+                    self.loading = False
                     self._wake.wait()
                     nxt = self._next_track()
 
@@ -378,6 +381,7 @@ class Engine:
                 self._started = time.monotonic()
                 self._paused_at = 0.0
                 self._paused_accum = 0.0
+                self.loading = True          # cleared once ffmpeg emits audio
                 track = nxt
 
             self._play_blocking(track)
@@ -407,13 +411,18 @@ class Engine:
             self._ytdlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE)
             self._ffmpeg = subprocess.Popen(
                 # -y: don't refuse to "overwrite" the FIFO, which always exists.
+                # -progress pipe:1: machine-readable progress on stdout, which we
+                # watch to know when audio actually starts flowing.
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                  "-i", "pipe:0", "-f", "s16le",
-                 "-ar", SAMPLE_RATE, "-ac", CHANNELS, SNAPFIFO],
-                stdin=self._ytdlp.stdout,
+                 "-ar", SAMPLE_RATE, "-ac", CHANNELS,
+                 "-progress", "pipe:1", SNAPFIFO],
+                stdin=self._ytdlp.stdout, stdout=subprocess.PIPE,
             )
             # Let ffmpeg own the read end so yt-dlp gets SIGPIPE if ffmpeg dies.
             self._ytdlp.stdout.close()
+            threading.Thread(target=self._watch_progress,
+                             args=(self._ffmpeg,), daemon=True).start()
             ff_rc = self._ffmpeg.wait()
             yt_rc = self._ytdlp.wait()
             elapsed = time.monotonic() - started
@@ -427,6 +436,7 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 — never let the worker die
             print(f"[player] error: {exc}", flush=True)
         finally:
+            self.loading = False
             self._signal_procs(signal.SIGCONT)  # in case we were paused
             for p in (self._ytdlp, self._ffmpeg):
                 if p and p.poll() is None:
@@ -435,6 +445,27 @@ class Engine:
                     except ProcessLookupError:
                         pass
             self._ytdlp = self._ffmpeg = None
+
+    def _watch_progress(self, proc):
+        """Clear `loading` once ffmpeg reports it's actually producing audio,
+        then keep draining its progress output so it never blocks on a full pipe."""
+        cleared = False
+        try:
+            # Must keep reading to EOF so ffmpeg never blocks on a full pipe;
+            # per-line errors are swallowed so the drain loop never stops early.
+            for raw in iter(proc.stdout.readline, b""):
+                if cleared:
+                    continue
+                try:
+                    if raw.startswith((b"out_time_us=", b"out_time_ms=")):
+                        val = raw.split(b"=", 1)[1].strip()
+                        if val.isdigit() and int(val.decode()) > 0:
+                            self.loading = False
+                            cleared = True
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def ensure_fifo():

@@ -158,7 +158,7 @@ function render(tracks, emptyMsg) {
       <img src="${t.thumb || ""}" />
       <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
       <button class="q">${ICON_PLUS}</button>`;
-    row.querySelector("img").onclick = row.querySelector(".meta").onclick = () => post("play", t);
+    row.querySelector("img").onclick = row.querySelector(".meta").onclick = () => play("play", t);
     row.querySelector(".q").onclick = e => { e.stopPropagation(); post("queue", t); flash(e.currentTarget); };
     listEl.appendChild(row);
   });
@@ -167,8 +167,8 @@ function render(tracks, emptyMsg) {
 // Buttons that play an entire shown list (playlist / library / search results).
 function listPlayActions(tracks) {
   return [
-    { label: LBL_PLAYALL, onclick: () => post("play_tracks", { tracks, shuffle: false }) },
-    { label: LBL_SHUFFLE, onclick: () => post("play_tracks", { tracks, shuffle: true }) },
+    { label: LBL_PLAYALL, onclick: () => play("play_tracks", { tracks, shuffle: false }) },
+    { label: LBL_SHUFFLE, onclick: () => play("play_tracks", { tracks, shuffle: true }) },
   ];
 }
 
@@ -257,8 +257,8 @@ $("#search").addEventListener("input", e => {
 });
 
 // --- transport ---
-$("#prev").onclick = () => action("prev");
-$("#next").onclick = () => action("next");
+$("#prev").onclick = () => action("prev", null, true);
+$("#next").onclick = () => action("next", null, true);
 $("#stop").onclick = () => action("stop");
 $("#playpause").onclick = () => action(paused ? "resume" : "pause");
 $("#shuffle").onclick = () => action("shuffle", { on: !shuffle });
@@ -331,9 +331,25 @@ function syncProgress(s) {
   }
 }
 
+// The play circle shows a spinner while a request is in flight (busy) OR while
+// the server is still starting a track's audio (loadingTrack); otherwise the
+// play/pause glyph.
+let busy = false, loadingTrack = false;
+function updatePlayButton() {
+  const pp = $("#playpause");
+  if (busy || (playing && loadingTrack)) {
+    pp.classList.remove("is-play");
+    if (!pp.querySelector(".spinner")) pp.innerHTML = '<span class="spinner"></span>';
+  } else {
+    pp.innerHTML = paused ? ICON_PLAY : ICON_PAUSE;
+    pp.classList.toggle("is-play", paused);
+  }
+}
+
 function applyStatus(s) {
   const p = $("#player");
   shuffle = s.shuffle; repeat = s.repeat;
+  loadingTrack = !!s.loading;
   $("#shuffle").classList.toggle("on", shuffle);
   const rb = $("#repeat");
   rb.classList.toggle("on", repeat !== "off");
@@ -345,11 +361,7 @@ function applyStatus(s) {
     $("#np-artist").textContent = s.current.artist || "";
     $("#np-img").src = s.current.thumb || "";
     paused = s.paused;
-    if (!busy) {                     // while busy the play circle shows a spinner
-      const pp = $("#playpause");
-      pp.innerHTML = s.paused ? ICON_PLAY : ICON_PAUSE;
-      pp.classList.toggle("is-play", s.paused);
-    }
+    updatePlayButton();
     syncProgress(s);
     $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
     renderProgress();
@@ -362,28 +374,33 @@ function applyStatus(s) {
 
 // Press feedback: spin the play circle and lock the controls until the action
 // returns, so a tap is obviously registered and can't be double-fired.
-let busy = false;
 function setBusy(on) {
   busy = on;
   $(".ctrls").classList.toggle("busy", on);
-  if (on) {
-    const pp = $("#playpause");
-    pp.classList.remove("is-play");
-    pp.innerHTML = '<span class="spinner"></span>';
-  }
+  updatePlayButton();
 }
-async function action(path, body) {
+async function action(path, body, changesTrack) {
   if (busy) return;                  // ignore taps while one is in flight
   setBusy(true);
   let s;
   try { s = await post(path, body); } catch (e) {}
+  // For track changes, keep the spinner until the server actually starts audio.
+  if (changesTrack) loadingTrack = true;
   setBusy(false);
-  if (s) applyStatus(s);             // reflect the new state immediately
+  if (s) applyStatus(s);
+  if (changesTrack) { loadingTrack = true; updatePlayButton(); }
+}
+
+// Start a new track (row tap / Play all): show the loading spinner right away.
+function play(path, body) {
+  loadingTrack = true; playing = true; updatePlayButton();
+  post(path, body).then(s => { if (s) applyStatus(s); loadingTrack = true; updatePlayButton(); })
+                  .catch(() => {});
 }
 
 async function poll() {
   try { applyStatus(await api("status")); } catch (e) {}
-  setTimeout(poll, 2000);
+  setTimeout(poll, loadingTrack ? 350 : 2000);   // poll fast while a track loads
 }
 // --- account / cookie upload ---
 const authBtn = $("#account"), authModal = $("#authModal"), authSheet = $("#authSheet");

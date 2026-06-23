@@ -24,7 +24,9 @@
   .meta { flex:1; min-width:0; }
   .meta .t { font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .meta .a { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .row .q { background:none; border:0; color:var(--dim); font-size:22px; padding:4px 8px; }
+  .row .q { background:none; border:0; color:var(--dim); padding:4px 8px;
+            display:flex; align-items:center; }
+  .row .q svg { display:block; }
   .hint { color:var(--dim); font-size:13px; padding:18px 14px; text-align:center; }
   .bar { display:flex; gap:8px; padding:4px 12px 8px; }
   .bar button { flex:1; background:var(--card); color:var(--txt); border:0; padding:10px;
@@ -40,13 +42,15 @@
   .track { flex:1; height:4px; border-radius:2px; background:#33333f; overflow:hidden; }
   .track > i { display:block; height:100%; width:0; background:var(--accent); }
   .ctrls { display:flex; justify-content:center; align-items:center; gap:14px; }
-  .ctrls button { background:none; border:0; color:var(--txt); font-size:24px; padding:2px; }
-  .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
-  /* shuffle/repeat are SVGs (not emoji) so color shows their on/off state. */
-  .ctrls .toggle { color:var(--dim); padding:6px; display:flex; align-items:center;
-                   transition:color .15s; }
+  .ctrls button { background:none; border:0; color:var(--txt); padding:2px;
+                  display:flex; align-items:center; justify-content:center; }
+  .ctrls button svg { display:block; }
+  .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; }
+  /* a play triangle looks left-heavy in a circle; nudge it to optically center */
+  .ctrls .play.is-play svg { transform:translateX(2px); }
+  /* shuffle/repeat tint to show on/off state */
+  .ctrls .toggle { color:var(--dim); padding:6px; transition:color .15s; }
   .ctrls .toggle.on { color:var(--accent); }
-  .ctrls .toggle svg { display:block; }
   .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
   .top h1 { margin:0; }
   .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
@@ -93,11 +97,11 @@
   </div>
   <div class="ctrls">
     <button id="shuffle" class="toggle" title="Shuffle"></button>
-    <button id="prev">⏮</button>
-    <button id="playpause" class="play">⏸</button>
-    <button id="next">⏭</button>
+    <button id="prev" title="Previous"></button>
+    <button id="playpause" class="play" title="Play/Pause"></button>
+    <button id="next" title="Next"></button>
     <button id="repeat" class="toggle" title="Repeat"></button>
-    <button id="stop">⏹</button>
+    <button id="stop" title="Stop"></button>
   </div>
 </div>
 
@@ -122,7 +126,7 @@ const post = (path, body) => api(path, {
 });
 const esc = s => (s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const fmt = s => { s = Math.max(0, s|0); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
-function flash(b){ b.textContent="✓"; setTimeout(()=>b.textContent="＋",700); }
+function flash(b){ b.innerHTML = ICON_CHECK; setTimeout(()=>{ b.innerHTML = ICON_PLUS; }, 700); }
 
 function showActions(buttons) {
   if (!buttons) { actionEl.style.display = "none"; actionEl.innerHTML = ""; return; }
@@ -147,9 +151,9 @@ function render(tracks, emptyMsg) {
     row.innerHTML = `
       <img src="${t.thumb || ""}" />
       <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
-      <button class="q">＋</button>`;
+      <button class="q">${ICON_PLUS}</button>`;
     row.querySelector("img").onclick = row.querySelector(".meta").onclick = () => post("play", t);
-    row.querySelector(".q").onclick = e => { e.stopPropagation(); post("queue", t); flash(e.target); };
+    row.querySelector(".q").onclick = e => { e.stopPropagation(); post("queue", t); flash(e.currentTarget); };
     listEl.appendChild(row);
   });
 }
@@ -204,7 +208,7 @@ function renderPlaylists(pls) {
       if (data.tracks.length) {
         showActions([
           ...listPlayActions(data.tracks),
-          { label: "↩", ghost: true, onclick: () => loadTab() },
+          { label: ICON_BACK, ghost: true, onclick: () => loadTab() },
         ]);
       }
     };
@@ -215,7 +219,7 @@ function renderPlaylists(pls) {
 function renderQueue(s) {
   showActions(null);
   const items = s.queue || [];
-  if (!items.length) { listEl.innerHTML = `<div class="hint">Queue is empty. Tap ＋ on a track, or “Play all” a playlist.</div>`; return; }
+  if (!items.length) { listEl.innerHTML = `<div class="hint">Queue is empty. Tap the + on a track, or “Play all” a playlist.</div>`; return; }
   showActions([{ label: LBL_CLEAR, onclick: async () => renderQueue(await post("queue/clear")) }]);
   listEl.innerHTML = "";
   items.forEach((t, i) => {
@@ -224,7 +228,7 @@ function renderQueue(s) {
     row.innerHTML = `
       <img src="${t.thumb || ""}" />
       <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
-      <button class="q">✕</button>`;
+      <button class="q">${ICON_X}</button>`;
     row.querySelector(".q").onclick = async () => renderQueue(await post("queue/remove", { index: i }));
     listEl.appendChild(row);
   });
@@ -262,16 +266,31 @@ const P_SHUFFLE = `<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="2
 const P_REPEAT = `<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>`;
 const P_TRASH = `<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`;
 const stroke = (b, s) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${b}</svg>`;
+const fill = (b, s) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor">${b}</svg>`;
 const ICON_SHUFFLE = stroke(P_SHUFFLE, 22);
 const ICON_REPEAT = stroke(P_REPEAT, 22);
 const ICON_REPEAT1 = stroke(P_REPEAT + `<path d="M11 10h1v4"/>`, 22);
+// Filled transport icons.
+const ICON_PREV = fill(`<path d="M7 6h2.2v12H7z"/><path d="M20 6v12l-9.5-6z"/>`, 22);
+const ICON_NEXT = fill(`<path d="M14.8 6H17v12h-2.2z"/><path d="M4 6v12l9.5-6z"/>`, 22);
+const ICON_STOP = fill(`<rect x="6" y="6" width="12" height="12" rx="2"/>`, 19);
+const ICON_PLAY = fill(`<path d="M7 5v14l12-7z"/>`, 24);
+const ICON_PAUSE = fill(`<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>`, 24);
+const ICON_PLUS = stroke(`<path d="M12 5v14M5 12h14"/>`, 20);
+const ICON_CHECK = stroke(`<path d="M5 12.5l4.5 4.5L19 6.5"/>`, 20);
+const ICON_X = stroke(`<path d="M6 6l12 12M18 6 6 18"/>`, 18);
+const ICON_BACK = stroke(`<path d="M9 14 4 9l5-5"/><path d="M4 9h11a4 4 0 0 1 4 4v4"/>`, 18);
 // Leading icons for text buttons (inline, sized to the label).
 const lead = (svg) => `<span style="display:inline-block;vertical-align:-3px;margin-right:6px">${svg}</span>`;
-const LBL_PLAYALL = lead(`<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`) + "Play all";
+const LBL_PLAYALL = lead(fill(`<path d="M8 5v14l11-7z"/>`, 14)) + "Play all";
 const LBL_SHUFFLE = lead(stroke(P_SHUFFLE, 15)) + "Shuffle play";
 const LBL_CLEAR = lead(stroke(P_TRASH, 15)) + "Clear queue";
 $("#shuffle").innerHTML = ICON_SHUFFLE;
 $("#repeat").innerHTML = ICON_REPEAT;
+$("#prev").innerHTML = ICON_PREV;
+$("#next").innerHTML = ICON_NEXT;
+$("#stop").innerHTML = ICON_STOP;
+$("#playpause").innerHTML = ICON_PAUSE;
 
 let paused = false, shuffle = false, repeat = "off";
 let playing = false, npDur = 0, npVid = null;
@@ -323,7 +342,9 @@ async function poll() {
       $("#np-title").textContent = s.current.title;
       $("#np-artist").textContent = s.current.artist || "";
       $("#np-img").src = s.current.thumb || "";
-      $("#playpause").textContent = s.paused ? "▶" : "⏸";
+      const pp = $("#playpause");
+      pp.innerHTML = s.paused ? ICON_PLAY : ICON_PAUSE;
+      pp.classList.toggle("is-play", s.paused);
       syncProgress(s);
       $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
       renderProgress();
@@ -387,13 +408,13 @@ async function uploadCookie(e) {
     r = await fetch("/api/cookies", { method: "POST", body: text });
     r = await r.json();
   } catch (err) { st.textContent = "Upload failed."; return; }
-  if (!r.ok) { st.textContent = "✗ " + (r.error || "rejected"); return; }
+  if (!r.ok) { st.textContent = "Couldn’t use that: " + (r.error || "rejected"); return; }
   if (r.authenticated) {
-    st.textContent = `✓ Logged in — found ${r.playlists} playlist(s).`;
+    st.textContent = `Logged in — found ${r.playlists} playlist(s).`;
     await refreshAuth();
     setTimeout(() => { closeAuth(); loadTab(); }, 1400);
   } else {
-    st.textContent = "⚠ Saved, but this looks signed-out (0 playlists). "
+    st.textContent = "Saved, but this looks signed-out (0 playlists). "
       + "Re-export while logged in to music.youtube.com.";
     await refreshAuth();
   }

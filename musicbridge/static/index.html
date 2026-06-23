@@ -42,10 +42,11 @@
   .ctrls { display:flex; justify-content:center; align-items:center; gap:14px; }
   .ctrls button { background:none; border:0; color:var(--txt); font-size:24px; padding:2px; }
   .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
-  /* Emoji glyphs ignore CSS `color`, so show state with opacity + a pill bg. */
-  .ctrls .toggle { font-size:18px; opacity:.38; padding:5px 8px; border-radius:9px;
-                   transition:opacity .15s, background .15s; }
-  .ctrls .toggle.on { opacity:1; background:rgba(255,67,86,.25); }
+  /* shuffle/repeat are SVGs (not emoji) so color shows their on/off state. */
+  .ctrls .toggle { color:var(--dim); padding:6px; display:flex; align-items:center;
+                   transition:color .15s; }
+  .ctrls .toggle.on { color:var(--accent); }
+  .ctrls .toggle svg { display:block; }
   .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
   .top h1 { margin:0; }
   .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
@@ -91,11 +92,11 @@
     <span class="time" id="t-dur">0:00</span>
   </div>
   <div class="ctrls">
-    <button id="shuffle" class="toggle" title="Shuffle">🔀</button>
+    <button id="shuffle" class="toggle" title="Shuffle"></button>
     <button id="prev">⏮</button>
     <button id="playpause" class="play">⏸</button>
     <button id="next">⏭</button>
-    <button id="repeat" class="toggle" title="Repeat">🔁</button>
+    <button id="repeat" class="toggle" title="Repeat"></button>
     <button id="stop">⏹</button>
   </div>
 </div>
@@ -256,6 +257,16 @@ $("#repeat").onclick = () => {
   post("repeat", { mode: next });
 };
 
+// Inline SVG transport icons (inherit `color`, so they tint for on/off state).
+const SVG = (b) => `<svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="2" stroke-linecap="round"
+  stroke-linejoin="round">${b}</svg>`;
+const ICON_SHUFFLE = SVG(`<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>`);
+const ICON_REPEAT = SVG(`<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>`);
+const ICON_REPEAT1 = SVG(`<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/>`);
+$("#shuffle").innerHTML = ICON_SHUFFLE;
+$("#repeat").innerHTML = ICON_REPEAT;
+
 let paused = false, shuffle = false, repeat = "off";
 let playing = false, npDur = 0, npVid = null;
 // Monotonic local clock: displayed = anchorElapsed + time since anchorTime.
@@ -299,7 +310,7 @@ async function poll() {
     $("#shuffle").classList.toggle("on", shuffle);
     const rb = $("#repeat");
     rb.classList.toggle("on", repeat !== "off");
-    rb.textContent = repeat === "one" ? "🔂" : "🔁";
+    rb.innerHTML = repeat === "one" ? ICON_REPEAT1 : ICON_REPEAT;
     playing = !!s.current;
     if (s.current) {
       p.classList.add("show");

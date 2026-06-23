@@ -42,8 +42,10 @@
   .ctrls { display:flex; justify-content:center; align-items:center; gap:14px; }
   .ctrls button { background:none; border:0; color:var(--txt); font-size:24px; padding:2px; }
   .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; font-size:22px; }
-  .ctrls .toggle { font-size:18px; color:var(--dim); }
-  .ctrls .toggle.on { color:var(--accent); }
+  /* Emoji glyphs ignore CSS `color`, so show state with opacity + a pill bg. */
+  .ctrls .toggle { font-size:18px; opacity:.38; padding:5px 8px; border-radius:9px;
+                   transition:opacity .15s, background .15s; }
+  .ctrls .toggle.on { opacity:1; background:rgba(255,67,86,.25); }
   .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
   .top h1 { margin:0; }
   .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }

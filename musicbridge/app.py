@@ -42,6 +42,13 @@ PORT = int(os.environ.get("PORT", "8080"))
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "/data/cookies.txt")
 YTM_ORIGIN = "https://music.youtube.com"
 
+# yt-dlp tuning. Logged-in cookies make YouTube serve PO-token/SABR-gated formats
+# to the default web client, so `bestaudio` can come up empty. We add a format
+# fallback plus alternate player clients (tv/web_safari still hand out plain
+# audio without PO tokens). Override via env if YouTube shifts again.
+YTDLP_FORMAT = os.environ.get("YTDLP_FORMAT", "bestaudio/best")
+YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "default,tv,web_safari")
+
 # Snapcast stream format — MUST match snapserver.conf (sampleformat=48000:16:2).
 SAMPLE_RATE = "48000"
 CHANNELS = "2"
@@ -376,8 +383,11 @@ class Engine:
     def _play_blocking(self, track: dict):
         video_id = track["videoId"]
         url = f"https://music.youtube.com/watch?v={video_id}"
-        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-o", "-",
+        ytdlp_cmd = ["yt-dlp", "-f", YTDLP_FORMAT, "-o", "-",
                      "--quiet", "--no-warnings", "--no-progress"]
+        if YTDLP_PLAYER_CLIENT:
+            ytdlp_cmd += ["--extractor-args",
+                          f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
         if os.path.exists(COOKIES_FILE):
             ytdlp_cmd += ["--cookies", COOKIES_FILE]
         ytdlp_cmd.append(url)

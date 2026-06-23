@@ -15,7 +15,6 @@ Control surface: a password-protected web UI (Traefik basic-auth in front).
 import json
 import os
 import random
-import re
 import signal
 import subprocess
 import threading
@@ -23,72 +22,139 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
-from ytmusicapi import OAuthCredentials, YTMusic
-from ytmusicapi.auth.oauth import RefreshingToken
+from ytmusicapi import YTMusic
+from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
+# browser.json (ytmusicapi browser auth) is generated from cookies.txt; we never
+# ask the user to craft it by hand.
 AUTH_FILE = os.environ.get("YTM_AUTH_FILE", "/data/browser.json")
-# OAuth device-flow token (self-refreshing). Preferred over browser.json because
-# it doesn't go stale. Needs a Google Cloud OAuth client of type "TVs and Limited
-# Input devices" — its id/secret go in the env below.
-OAUTH_FILE = os.environ.get("YTM_OAUTH_FILE", "/data/oauth.json")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 SNAPFIFO = os.environ.get("SNAPFIFO", "/snapfifo/snapfifo")
 PORT = int(os.environ.get("PORT", "8080"))
-# Optional Netscape cookies.txt for yt-dlp, used if present. YouTube increasingly
-# demands cookies ("confirm you're not a bot") for stream extraction.
+# Netscape cookies.txt — the single credential. It powers BOTH yt-dlp stream
+# extraction AND (via browser.json, built from it) account access in ytmusicapi.
+# Uploaded through the web UI's Account button.
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "/data/cookies.txt")
+YTM_ORIGIN = "https://music.youtube.com"
 
 # Snapcast stream format — MUST match snapserver.conf (sampleformat=48000:16:2).
 SAMPLE_RATE = "48000"
 CHANNELS = "2"
 
 # --------------------------------------------------------------------------- #
-# YouTube Music account (lazy — never block server startup on a network call)
+# YouTube Music account — cookie-based browser auth
 # --------------------------------------------------------------------------- #
 
-# ytmusicapi is used ONLY for public search. Its authenticated/InnerTube calls
-# are unreliable (OAuth 400s server-side, cookies go stale), so anything
-# account-specific goes through the official YouTube Data API below instead.
 _ytmusic: Optional[YTMusic] = None
 _ytmusic_lock = threading.Lock()
 
 
-def oauth_credentials() -> Optional[OAuthCredentials]:
-    """OAuth client creds from env, or None if not configured."""
-    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
-        return OAuthCredentials(client_id=GOOGLE_CLIENT_ID,
-                                client_secret=GOOGLE_CLIENT_SECRET)
-    return None
+def parse_cookies_txt(path: str) -> dict:
+    """Read a Netscape cookies.txt into {name: value}, keeping #HttpOnly_ ones
+    (the session cookies most naive parsers drop)."""
+    cookies: dict = {}
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or (line.startswith("#")
+                            and not line.startswith("#HttpOnly_")):
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies[parts[5]] = parts[6]
+    return cookies
+
+
+def build_browser_json() -> bool:
+    """Generate browser.json from cookies.txt. Returns True if written.
+
+    ytmusicapi classifies a headers file as 'browser' only if it has an
+    authorization header containing SAPISIDHASH; it regenerates the actual hash
+    per request from the cookie, so this stays valid as long as the cookie does.
+    """
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    cookies = parse_cookies_txt(COOKIES_FILE)
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    try:
+        authorization = get_authorization(sapisid_from_cookie(cookie_str)
+                                          + " " + YTM_ORIGIN)
+    except Exception as exc:  # noqa: BLE001 — bad/incomplete cookie
+        print(f"[ytm] cannot build browser.json from cookies: {exc}", flush=True)
+        return False
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "authorization": authorization,
+        "x-goog-authuser": "0",
+        "x-origin": YTM_ORIGIN,
+        "origin": YTM_ORIGIN,
+        "cookie": cookie_str,
+    }
+    with open(AUTH_FILE, "w") as f:
+        json.dump(headers, f)
+    print(f"[ytm] built {AUTH_FILE} from cookies.txt "
+          f"({len(cookies)} cookies)", flush=True)
+    return True
 
 
 def auth_method() -> str:
-    """Account auth state for the UI: 'oauth' (connected) | 'none'."""
-    if os.path.exists(OAUTH_FILE) and oauth_credentials():
-        return "oauth"
-    return "none"
+    """Account auth state for the UI: 'browser' (have cookie) | 'none'."""
+    return "browser" if os.path.exists(AUTH_FILE) else "none"
 
 
 def get_ytmusic() -> YTMusic:
-    """Unauthenticated ytmusicapi client (public search only), built lazily so a
-    slow YouTube request can never block server startup."""
+    """ytmusicapi client, built lazily. Uses browser auth if browser.json exists,
+    else unauthenticated (public search only)."""
     global _ytmusic
     if _ytmusic is None:
         with _ytmusic_lock:
             if _ytmusic is None:
-                _ytmusic = YTMusic()
+                if os.path.exists(AUTH_FILE):
+                    print(f"[ytm] using browser auth from {AUTH_FILE}", flush=True)
+                    _ytmusic = YTMusic(AUTH_FILE)
+                else:
+                    print("[ytm] no cookie — running unauthenticated "
+                          "(public search only)", flush=True)
+                    _ytmusic = YTMusic()
     return _ytmusic
 
 
+def reset_ytmusic():
+    """Drop the cached client so the next call rebuilds with current auth."""
+    global _ytmusic
+    with _ytmusic_lock:
+        _ytmusic = None
+
+
+def account_probe() -> dict:
+    """Check whether the current cookie is a logged-in session and report counts."""
+    try:
+        ytm = get_ytmusic()
+        playlists = ytm.get_library_playlists(limit=50)
+        # get_liked_songs throws a specific error when the session is signed out;
+        # if it returns, we're definitely authenticated.
+        try:
+            liked = ytm.get_liked_songs(limit=1)
+            liked_ok = True
+        except Exception:  # noqa: BLE001
+            liked_ok = False
+        authenticated = len(playlists) > 0 or liked_ok
+        return {"authenticated": authenticated, "playlists": len(playlists)}
+    except Exception as exc:  # noqa: BLE001
+        return {"authenticated": False, "error": str(exc)[:200]}
+
+
 def normalize_track(item: dict) -> Optional[dict]:
-    """Reduce a ytmusicapi search result to the fields the UI/player need."""
+    """Reduce a ytmusicapi result to the fields the UI and player need."""
     video_id = item.get("videoId")
     if not video_id:
         return None
@@ -105,116 +171,6 @@ def normalize_track(item: dict) -> Optional[dict]:
         "thumb": thumb,
         "duration": item.get("duration_seconds"),
     }
-
-
-# --------------------------------------------------------------------------- #
-# YouTube Data API v3 — the user's playlists & liked music (official, stable)
-# --------------------------------------------------------------------------- #
-
-DATA_API = "https://www.googleapis.com/youtube/v3"
-_token_lock = threading.Lock()
-
-
-class DataAPIError(Exception):
-    pass
-
-
-def get_access_token() -> Optional[str]:
-    """A valid OAuth access token for the Data API, refreshing if near expiry."""
-    creds = oauth_credentials()
-    if not creds or not os.path.exists(OAUTH_FILE):
-        return None
-    with _token_lock:
-        with open(OAUTH_FILE) as f:
-            tok = json.load(f)
-        if tok.get("expires_at", 0) - time.time() < 120:
-            refreshed = creds.refresh_token(tok["refresh_token"])
-            tok["access_token"] = refreshed["access_token"]
-            tok["expires_in"] = refreshed.get("expires_in", 3600)
-            tok["expires_at"] = int(time.time()) + tok["expires_in"]
-            if refreshed.get("refresh_token"):
-                tok["refresh_token"] = refreshed["refresh_token"]
-            with open(OAUTH_FILE, "w") as f:
-                json.dump(tok, f)
-        return tok.get("access_token")
-
-
-def yt_api(path: str, params: dict) -> dict:
-    token = get_access_token()
-    if not token:
-        raise DataAPIError("not connected — sign in on the Account page")
-    r = requests.get(f"{DATA_API}/{path}", params=params,
-                     headers={"Authorization": f"Bearer {token}"}, timeout=15)
-    if r.status_code != 200:
-        raise DataAPIError(f"Data API {r.status_code}: {r.text[:200]}")
-    return r.json()
-
-
-def iso8601_to_seconds(s: Optional[str]) -> Optional[int]:
-    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", s or "")
-    if not m:
-        return None
-    h, mi, se = (int(x) if x else 0 for x in m.groups())
-    return h * 3600 + mi * 60 + se
-
-
-def _thumb(thumbs: dict) -> Optional[str]:
-    for k in ("maxres", "standard", "high", "medium", "default"):
-        if thumbs and k in thumbs:
-            return thumbs[k]["url"]
-    return None
-
-
-def _clean_artist(name: str) -> str:
-    return (name or "").removesuffix(" - Topic")
-
-
-def track_from_playlist_item(item: dict, durations: dict) -> Optional[dict]:
-    sn = item.get("snippet", {})
-    vid = item.get("contentDetails", {}).get("videoId")
-    title = sn.get("title")
-    if not vid or title in ("Deleted video", "Private video"):
-        return None
-    return {
-        "videoId": vid,
-        "title": title or "Unknown",
-        "artist": _clean_artist(sn.get("videoOwnerChannelTitle", "")),
-        "album": None,
-        "thumb": _thumb(sn.get("thumbnails", {})),
-        "duration": durations.get(vid),
-    }
-
-
-def track_from_video(item: dict) -> Optional[dict]:
-    vid = item.get("id")
-    if not vid:
-        return None
-    sn = item.get("snippet", {})
-    return {
-        "videoId": vid,
-        "title": sn.get("title", "Unknown"),
-        "artist": _clean_artist(sn.get("channelTitle", "")),
-        "album": None,
-        "thumb": _thumb(sn.get("thumbnails", {})),
-        "duration": iso8601_to_seconds(item.get("contentDetails", {}).get("duration")),
-    }
-
-
-def fetch_durations(video_ids: list) -> dict:
-    """videos.list in batches of 50 → {videoId: seconds}, best-effort."""
-    out: dict = {}
-    for i in range(0, len(video_ids), 50):
-        chunk = [v for v in video_ids[i:i + 50] if v]
-        if not chunk:
-            continue
-        try:
-            data = yt_api("videos", {"part": "contentDetails", "id": ",".join(chunk)})
-        except DataAPIError:
-            break
-        for it in data.get("items", []):
-            out[it["id"]] = iso8601_to_seconds(
-                it.get("contentDetails", {}).get("duration"))
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -490,83 +446,42 @@ def favicon():
     return Response(status=204)
 
 
-# --- Google account connect (OAuth device flow) ---------------------------- #
-# Single-user app, so one in-flight flow is enough.
-_auth_flow: dict = {}
-_auth_lock = threading.Lock()
+# --- Account (cookie upload) ----------------------------------------------- #
 
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    return jsonify({"method": auth_method(),
-                    "configured": oauth_credentials() is not None})
+    return jsonify({"method": auth_method()})
 
 
-@app.post("/api/auth/start")
-def api_auth_start():
-    creds = oauth_credentials()
-    if not creds:
-        return jsonify({"error": "OAuth is not configured. Set GOOGLE_CLIENT_ID "
-                        "and GOOGLE_CLIENT_SECRET (a 'TVs and Limited Input "
-                        "devices' client) in the environment and restart."}), 400
-    try:
-        code = creds.get_code()
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"could not start login: {exc}"}), 400
-    with _auth_lock:
-        _auth_flow.clear()
-        _auth_flow["device_code"] = code["device_code"]
-    url = code.get("verification_url", "https://www.google.com/device")
-    return jsonify({
-        "user_code": code.get("user_code"),
-        "verification_url": url,
-        "interval": code.get("interval", 5),
-        "expires_in": code.get("expires_in", 1800),
-    })
-
-
-@app.post("/api/auth/poll")
-def api_auth_poll():
-    creds = oauth_credentials()
-    # Hold the lock across the whole exchange so concurrent polls serialize: the
-    # first one redeems the (single-use) device code; any others then see it
-    # cleared and return "idle" instead of redeeming it again and getting the
-    # spurious invalid_grant that would clobber the success.
-    with _auth_lock:
-        device_code = _auth_flow.get("device_code")
-        if not creds or not device_code:
-            return jsonify({"status": "idle"})
-        try:
-            raw = creds.token_from_code(device_code)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"status": "error", "error": str(exc)})
-        if raw.get("access_token"):
-            # Google adds fields (e.g. refresh_token_expires_in) that
-            # RefreshingToken's constructor rejects, so keep only what it wants.
-            allowed = {"access_token", "refresh_token", "scope",
-                       "token_type", "expires_in"}
-            token = RefreshingToken(
-                credentials=creds,
-                **{k: v for k, v in raw.items() if k in allowed},
-            )
-            token.store_token(OAUTH_FILE)
-            _auth_flow.clear()
-            reset_ytmusic()
-            print(f"[ytm] OAuth token stored at {OAUTH_FILE}", flush=True)
-            return jsonify({"status": "connected"})
-        err = raw.get("error")
-        if err in ("authorization_pending", "slow_down"):
-            return jsonify({"status": "pending"})
-        # Hard error (expired/invalid code) — drop it so we stop hammering and
-        # the user can cleanly start over.
-        _auth_flow.clear()
-        return jsonify({"status": "error", "error": err or "unknown error"})
+@app.post("/api/cookies")
+def api_cookies():
+    """Receive an uploaded Netscape cookies.txt, store it, (re)build browser.json,
+    and report whether it's a logged-in session."""
+    raw = request.get_data(as_text=True) or ""
+    if "\t" not in raw or "youtube" not in raw.lower():
+        return jsonify({"ok": False,
+                        "error": "That doesn't look like a cookies.txt "
+                        "(expected Netscape/tab-separated YouTube cookies)."}), 400
+    with open(COOKIES_FILE, "w") as f:
+        f.write(raw)
+    if not build_browser_json():
+        return jsonify({"ok": False,
+                        "error": "Saved, but the cookie is missing the values "
+                        "needed for login (SAPISID). Re-export while logged in "
+                        "to music.youtube.com."}), 400
+    reset_ytmusic()
+    probe = account_probe()
+    print(f"[ytm] cookie uploaded — authenticated={probe.get('authenticated')} "
+          f"playlists={probe.get('playlists')}", flush=True)
+    return jsonify({"ok": True, **probe})
 
 
 @app.post("/api/auth/logout")
 def api_auth_logout():
-    if os.path.exists(OAUTH_FILE):
-        os.remove(OAUTH_FILE)
+    for path in (AUTH_FILE, COOKIES_FILE):
+        if os.path.exists(path):
+            os.remove(path)
     reset_ytmusic()
     return jsonify({"method": auth_method()})
 
@@ -582,67 +497,34 @@ def api_search():
 
 @app.get("/api/library")
 def api_library():
-    """The 'Library' tab shows your Liked Music (videos you've liked)."""
     try:
-        tracks, page = [], None
-        while len(tracks) < 100:
-            params = {"part": "snippet,contentDetails", "myRating": "like",
-                      "maxResults": 50}
-            if page:
-                params["pageToken"] = page
-            data = yt_api("videos", params)
-            tracks += [t for t in (track_from_video(i) for i in data.get("items", [])) if t]
-            page = data.get("nextPageToken")
-            if not page:
-                break
-        return jsonify(tracks)
-    except DataAPIError as exc:
-        return jsonify({"error": f"Liked music: {exc}"}), 400
+        songs = get_ytmusic().get_library_songs(limit=100)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"library needs a cookie (Account): {exc}"}), 400
+    return jsonify([t for t in (normalize_track(s) for s in songs) if t])
 
 
 @app.get("/api/playlists")
 def api_playlists():
     try:
-        out, page = [], None
-        while True:
-            params = {"part": "snippet", "mine": "true", "maxResults": 50}
-            if page:
-                params["pageToken"] = page
-            data = yt_api("playlists", params)
-            for p in data.get("items", []):
-                out.append({
-                    "playlistId": p["id"],
-                    "title": p.get("snippet", {}).get("title"),
-                    "thumb": _thumb(p.get("snippet", {}).get("thumbnails", {})),
-                })
-            page = data.get("nextPageToken")
-            if not page:
-                break
-        return jsonify(out)
-    except DataAPIError as exc:
-        return jsonify({"error": f"Playlists: {exc}"}), 400
+        pls = get_ytmusic().get_library_playlists(limit=100)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"playlists need a cookie (Account): {exc}"}), 400
+    return jsonify([
+        {
+            "playlistId": p.get("playlistId"),
+            "title": p.get("title"),
+            "thumb": (p.get("thumbnails") or [{}])[-1].get("url"),
+        }
+        for p in pls if p.get("playlistId")
+    ])
 
 
 @app.get("/api/playlist/<playlist_id>")
 def api_playlist(playlist_id):
-    try:
-        items, page = [], None
-        while len(items) < 200:
-            params = {"part": "snippet,contentDetails",
-                      "playlistId": playlist_id, "maxResults": 50}
-            if page:
-                params["pageToken"] = page
-            data = yt_api("playlistItems", params)
-            items += data.get("items", [])
-            page = data.get("nextPageToken")
-            if not page:
-                break
-        durations = fetch_durations(
-            [i.get("contentDetails", {}).get("videoId") for i in items])
-        tracks = [t for t in (track_from_playlist_item(i, durations) for i in items) if t]
-        return jsonify({"title": "", "tracks": tracks})
-    except DataAPIError as exc:
-        return jsonify({"error": f"Playlist: {exc}"}), 400
+    pl = get_ytmusic().get_playlist(playlist_id, limit=200)
+    tracks = [t for t in (normalize_track(x) for x in pl.get("tracks", [])) if t]
+    return jsonify({"title": pl.get("title"), "tracks": tracks})
 
 
 @app.post("/api/play")
@@ -714,8 +596,10 @@ def api_status():
 if __name__ == "__main__":
     if os.path.exists(COOKIES_FILE):
         print(f"[ytdlp] using cookies from {COOKIES_FILE}")
+        # Keep browser.json in sync with the (possibly refreshed) cookie.
+        build_browser_json()
     else:
-        print(f"[ytdlp] no cookies file at {COOKIES_FILE} — playback works "
-              "until YouTube demands a 'not a bot' check")
+        print(f"[ytdlp] no cookies file at {COOKIES_FILE} — upload one via the "
+              "Account button (powers both playback and library/playlists)")
     print(f"[musicbridge] serving on :{PORT}, FIFO={SNAPFIFO}")
     serve(app, host="0.0.0.0", port=PORT, threads=8)

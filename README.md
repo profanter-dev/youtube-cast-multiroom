@@ -53,39 +53,33 @@ htpasswd -nbB youruser 'yourpassword'
 Put the result in `.env` as `MUSIC_AUTH`, **doubling every `$`** (compose treats a
 single `$` as a variable). Example: `$2y$05$abc…` becomes `$$2y$$05$$abc…`.
 
-### 2. Connect your YouTube Music account (one-time)
+### 2. Connect your YouTube Music account (cookie upload)
 
-Library and Playlists need your Google account. The easiest, most durable way is
-**Sign in with Google** right from the web UI's **Account** button — it uses a
-self-refreshing OAuth token, so you never have to re-capture cookies.
+Search and playback work out of the box. **Library and Playlists** need your
+account, which musicbridge gets from a single **`cookies.txt`** exported from a
+browser logged into YouTube Music. The same cookie also lets yt-dlp pull streams
+past YouTube's "are you a bot?" checks — one file powers everything.
 
-It needs a free, one-time OAuth client (Google retired the shared one):
+Upload it from the web UI's **Account** button (no SSH needed):
 
-1. Go to <https://console.cloud.google.com/> → create a project (any name).
-2. **APIs & Services → Library** → enable **YouTube Data API v3**.
-3. **APIs & Services → OAuth consent screen** → choose **External**, fill the
-   required fields, and add **your own Google account** under *Test users*.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID** →
-   application type **TVs and Limited Input devices**. Copy the **Client ID** and
-   **Client secret**.
-5. Put them in `.env`:
-   ```bash
-   GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com
-   GOOGLE_CLIENT_SECRET=xxxx
-   ```
-6. `docker compose up -d musicbridge`, open the web UI, tap **Account → Start
-   login**, open the shown link, enter the code, approve. Done — the token is
-   stored at `$DATA_DIR/musicbridge/oauth.json` and refreshes itself.
+1. Open <https://music.youtube.com> in a browser and confirm you're logged in
+   (your avatar shows, your library is visible).
+2. Install the **"Get cookies.txt LOCALLY"** extension (Chrome/Brave web store).
+3. On the music.youtube.com tab, click the extension → **Export** (current site).
+4. In musicbridge, tap **Account → Choose cookies.txt** and pick that file.
 
-**What the login powers:** your **Playlists** and **Liked** music come from the
-official **YouTube Data API v3** using this OAuth token (stable + self-refreshing).
-**Search** is public and needs no login. Playback always uses yt-dlp (+ optional
-`cookies.txt`). Note the YTM-only "songs added to library" bucket isn't exposed by
-the official API — the Liked tab covers your liked tracks instead.
+The page confirms how many playlists it found. If it says *"signed-out / 0
+playlists"*, the export wasn't from a logged-in YouTube Music session — redo
+step 1. The cookie is stored at `$DATA_DIR/musicbridge/cookies.txt`, and
+`browser.json` (ytmusicapi browser auth) is generated from it automatically.
 
-> Why not `ytmusicapi`'s own auth for the library? Its OAuth path currently 400s
-> server-side (a YouTube change), and browser-cookie auth goes stale. Going
-> straight to the official Data API for playlists/liked sidesteps both.
+> Cookies go stale every few weeks — when Library/Playlists empty out, just
+> re-export and re-upload via **Account → Replace cookie**.
+>
+> Why cookies and not OAuth? YouTube Music has no usable official API for the
+> library, and `ytmusicapi`'s OAuth path is currently broken server-side. The
+> web client (cookie auth) is the only thing that returns your *full* library,
+> including saved playlists.
 
 ### 3. Start
 
@@ -124,9 +118,7 @@ docker compose build musicbridge && docker compose up -d musicbridge
 
 | Variable | Description |
 |---|---|
-| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/oauth.json`, optional `cookies.txt`). |
+| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/cookies.txt` + generated `browser.json`). |
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | `htpasswd` `user:hash` for the web UI (double every `$`). |
-| `GOOGLE_CLIENT_ID` | OAuth client ID for Google login (optional; "TVs and Limited Input devices"). |
-| `GOOGLE_CLIENT_SECRET` | OAuth client secret matching `GOOGLE_CLIENT_ID`. |

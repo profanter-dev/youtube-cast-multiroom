@@ -282,84 +282,67 @@ async function poll() {
   } catch (e) {}
   setTimeout(poll, 2000);
 }
-// --- account / Google login (OAuth device flow) ---
+// --- account / cookie upload ---
 const authBtn = $("#account"), authModal = $("#authModal"), authSheet = $("#authSheet");
-let authMethod = "none", authConfigured = false, pollTimer = null;
+let authMethod = "none";
 
 async function refreshAuth() {
   try {
     const s = await api("auth/status");
-    authMethod = s.method; authConfigured = s.configured;
+    authMethod = s.method;
     authBtn.textContent = authMethod === "none" ? "Connect" : "Account";
     authBtn.classList.toggle("ok", authMethod !== "none");
   } catch (e) {}
 }
 
-function closeAuth() {
-  authModal.classList.remove("show");
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-}
+function closeAuth() { authModal.classList.remove("show"); }
 function bindClose() { const c = $("#closeAuth"); if (c) c.onclick = closeAuth; }
 authBtn.onclick = () => { renderAuth(); authModal.classList.add("show"); };
 authModal.onclick = e => { if (e.target === authModal) closeAuth(); };
 
-function renderAuth() {
-  if (authMethod === "oauth") {
-    authSheet.innerHTML = `<h2>Account connected</h2>
-      <p>Signed in with your Google account. Library &amp; playlists use this token, which refreshes itself.</p>
-      <button class="btn" id="logout">Disconnect</button>
-      <button class="btn sec" id="closeAuth">Close</button>`;
-    $("#logout").onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); loadTab(); };
-  } else if (!authConfigured) {
-    authSheet.innerHTML = `<h2>Login not configured</h2>
-      <p>Set <b>GOOGLE_CLIENT_ID</b> and <b>GOOGLE_CLIENT_SECRET</b> (a “TVs and Limited Input
-      devices” OAuth client) in the server environment and restart.
-      ${authMethod === "browser" ? "A browser.json is currently in use." : ""}</p>
-      <button class="btn sec" id="closeAuth">Close</button>`;
-  } else {
-    authSheet.innerHTML = `<h2>Connect Google account</h2>
-      <p>Log in once with your real Google account. The token refreshes itself, so you won’t have to redo this.</p>
-      <button class="btn" id="startAuth">Start login</button>
-      <button class="btn sec" id="closeAuth">Close</button>`;
-    $("#startAuth").onclick = startAuth;
-  }
-  bindClose();
-}
+const HOWTO = `<p>Your library, playlists and playback all use one <b>cookies.txt</b>
+  from a browser logged into YouTube Music:</p>
+  <p>1. Open <b>music.youtube.com</b> and confirm you’re logged in (your avatar shows).<br>
+  2. Install the “<b>Get cookies.txt LOCALLY</b>” browser extension.<br>
+  3. On that tab, click the extension → <b>Export</b> (current site).<br>
+  4. Pick the file below.</p>`;
 
-async function startAuth() {
-  authSheet.innerHTML = `<p>Starting…</p>`;
-  let d;
-  try { d = await post("auth/start"); }
-  catch (e) {
-    authSheet.innerHTML = `<h2>Couldn’t start</h2><p>${esc(e.message)}</p>
-      <button class="btn sec" id="closeAuth">Close</button>`;
-    bindClose(); return;
-  }
-  const host = (d.verification_url || "").replace(/^https?:\/\//, "");
-  authSheet.innerHTML = `<h2>Sign in to Google</h2>
-    <p>Open the link below and enter this code:</p>
-    <div class="code">${esc(d.user_code || "")}</div>
-    <a class="btn" href="${esc(d.verification_url)}" target="_blank" rel="noopener">Open ${esc(host)}</a>
-    <p id="authState">Waiting for approval…</p>
+function renderAuth() {
+  const connected = authMethod !== "none";
+  authSheet.innerHTML = `<h2>${connected ? "Account" : "Connect your account"}</h2>
+    ${connected ? "<p>A cookie is loaded. Re-upload to refresh it when library/playlists go stale.</p>" : HOWTO}
+    <label class="btn" for="ckfile">${connected ? "Replace cookie" : "Choose cookies.txt"}</label>
+    <input id="ckfile" type="file" accept=".txt,text/plain" style="display:none">
+    <p id="authState"></p>
+    ${connected ? '<button class="btn sec" id="logout">Remove cookie</button>' : ""}
     <button class="btn sec" id="closeAuth">Close</button>`;
   bindClose();
-  const interval = Math.max(2, d.interval || 5) * 1000;
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    let r;
-    try { r = await post("auth/poll"); } catch (e) { return; }
-    if (!pollTimer) return;            // a sibling poll already finished the flow
-    const st = $("#authState");
-    if (r.status === "connected") {
-      clearInterval(pollTimer); pollTimer = null;
-      if (st) st.textContent = "Connected! 🎉";
-      await refreshAuth();
-      setTimeout(() => { closeAuth(); loadTab(); }, 1200);
-    } else if (r.status === "error") {
-      clearInterval(pollTimer); pollTimer = null;
-      if (st) st.textContent = "Error: " + (r.error || "unknown");
-    }
-  }, interval);
+  $("#ckfile").onchange = uploadCookie;
+  const lo = $("#logout");
+  if (lo) lo.onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); loadTab(); };
+}
+
+async function uploadCookie(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const st = $("#authState");
+  st.textContent = "Uploading…";
+  const text = await file.text();
+  let r;
+  try {
+    r = await fetch("/api/cookies", { method: "POST", body: text });
+    r = await r.json();
+  } catch (err) { st.textContent = "Upload failed."; return; }
+  if (!r.ok) { st.textContent = "✗ " + (r.error || "rejected"); return; }
+  if (r.authenticated) {
+    st.textContent = `✓ Logged in — found ${r.playlists} playlist(s).`;
+    await refreshAuth();
+    setTimeout(() => { closeAuth(); loadTab(); }, 1400);
+  } else {
+    st.textContent = "⚠ Saved, but this looks signed-out (0 playlists). "
+      + "Re-export while logged in to music.youtube.com.";
+    await refreshAuth();
+  }
 }
 
 refreshAuth();

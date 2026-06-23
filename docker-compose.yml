@@ -8,11 +8,6 @@ services:
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ${DATA_DIR}/musicbridge:/data
-    environment:
-      # OAuth "TVs and Limited Input devices" client for Google login (optional;
-      # without it the Account page says "login not configured"). See README.
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
-      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
     networks:
       - traefik
     labels:

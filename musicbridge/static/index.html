@@ -257,18 +257,39 @@ $("#repeat").onclick = () => {
 };
 
 let paused = false, shuffle = false, repeat = "off";
-let playing = false, npDur = 0, npElapsed = 0, npSyncAt = 0;
+let playing = false, npDur = 0, npVid = null;
+// Monotonic local clock: displayed = anchorElapsed + time since anchorTime.
+let anchorElapsed = 0, anchorTime = 0;
 
-// Tick the clock locally between 2s polls so the time/bar move smoothly.
+function displayedElapsed() {
+  let cur = paused ? anchorElapsed : anchorElapsed + (performance.now() - anchorTime) / 1000;
+  if (npDur) cur = Math.min(cur, npDur);
+  return Math.max(0, cur);
+}
 function renderProgress() {
   if (!playing) return;
-  let cur = npElapsed;
-  if (!paused) cur += (Date.now() - npSyncAt) / 1000;
-  if (npDur) cur = Math.min(cur, npDur);
+  const cur = displayedElapsed();
   $("#t-cur").textContent = fmt(cur);
   $("#t-fill").style.width = npDur ? Math.min(100, cur / npDur * 100) + "%" : "0%";
 }
-setInterval(renderProgress, 500);
+setInterval(renderProgress, 250);
+
+// Re-anchor only on real changes or >1s drift; ignore sub-second jitter so the
+// clock never ticks twice or jumps backward.
+function syncProgress(s) {
+  const trackChanged = s.current.videoId !== npVid;
+  npVid = s.current.videoId;
+  npDur = s.current.duration || 0;
+  const wasPaused = paused;
+  paused = s.paused;
+  const predicted = displayedElapsed();
+  const serverEl = s.elapsed || 0;
+  if (trackChanged || paused !== wasPaused || !anchorTime
+      || Math.abs(serverEl - predicted) > 1) {
+    anchorElapsed = serverEl;
+    anchorTime = performance.now();
+  }
+}
 
 async function poll() {
   try {
@@ -285,15 +306,13 @@ async function poll() {
       $("#np-title").textContent = s.current.title;
       $("#np-artist").textContent = s.current.artist || "";
       $("#np-img").src = s.current.thumb || "";
-      paused = s.paused;
-      $("#playpause").textContent = paused ? "▶" : "⏸";
-      npDur = s.current.duration || 0;
-      npElapsed = s.elapsed || 0;       // re-sync to the server's truth
-      npSyncAt = Date.now();
+      $("#playpause").textContent = s.paused ? "▶" : "⏸";
+      syncProgress(s);
       $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
       renderProgress();
     } else {
       p.classList.remove("show");
+      npVid = null;
     }
     if (tab === "queue") renderQueue(s);   // keep the queue view live
   } catch (e) {}

@@ -315,7 +315,7 @@ class Engine:
                 "playing": self.current is not None,
                 "shuffle": self.shuffle,
                 "repeat": self.repeat,
-                "elapsed": round(self._elapsed()),
+                "elapsed": round(self._elapsed(), 1),
             }
 
     # -- internals ---------------------------------------------------------- #

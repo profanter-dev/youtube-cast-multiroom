@@ -51,6 +51,12 @@
   /* shuffle/repeat tint to show on/off state */
   .ctrls .toggle { color:var(--dim); padding:6px; transition:color .15s; }
   .ctrls .toggle.on { color:var(--accent); }
+  /* busy: lock the controls and spin the play circle while an action runs */
+  .ctrls.busy button { pointer-events:none; }
+  .ctrls.busy .toggle, .ctrls.busy #prev, .ctrls.busy #next, .ctrls.busy #stop { opacity:.4; }
+  .spinner { width:22px; height:22px; border:3px solid rgba(255,255,255,.35);
+             border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
   .top h1 { margin:0; }
   .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
@@ -251,15 +257,13 @@ $("#search").addEventListener("input", e => {
 });
 
 // --- transport ---
-$("#prev").onclick = () => post("prev");
-$("#next").onclick = () => post("next");
-$("#stop").onclick = () => post("stop");
-$("#playpause").onclick = () => post(paused ? "resume" : "pause");
-$("#shuffle").onclick = () => post("shuffle", { on: !shuffle });
-$("#repeat").onclick = () => {
-  const next = { off: "all", all: "one", one: "off" }[repeat] || "off";
-  post("repeat", { mode: next });
-};
+$("#prev").onclick = () => action("prev");
+$("#next").onclick = () => action("next");
+$("#stop").onclick = () => action("stop");
+$("#playpause").onclick = () => action(paused ? "resume" : "pause");
+$("#shuffle").onclick = () => action("shuffle", { on: !shuffle });
+$("#repeat").onclick = () =>
+  action("repeat", { mode: { off: "all", all: "one", one: "off" }[repeat] || "off" });
 
 // Inline SVG icons (inherit `color`, so they tint by state and match the bar).
 const P_SHUFFLE = `<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>`;
@@ -327,33 +331,58 @@ function syncProgress(s) {
   }
 }
 
-async function poll() {
-  try {
-    const s = await api("status");
-    const p = $("#player");
-    shuffle = s.shuffle; repeat = s.repeat;
-    $("#shuffle").classList.toggle("on", shuffle);
-    const rb = $("#repeat");
-    rb.classList.toggle("on", repeat !== "off");
-    rb.innerHTML = repeat === "one" ? ICON_REPEAT1 : ICON_REPEAT;
-    playing = !!s.current;
-    if (s.current) {
-      p.classList.add("show");
-      $("#np-title").textContent = s.current.title;
-      $("#np-artist").textContent = s.current.artist || "";
-      $("#np-img").src = s.current.thumb || "";
+function applyStatus(s) {
+  const p = $("#player");
+  shuffle = s.shuffle; repeat = s.repeat;
+  $("#shuffle").classList.toggle("on", shuffle);
+  const rb = $("#repeat");
+  rb.classList.toggle("on", repeat !== "off");
+  rb.innerHTML = repeat === "one" ? ICON_REPEAT1 : ICON_REPEAT;
+  playing = !!s.current;
+  if (s.current) {
+    p.classList.add("show");
+    $("#np-title").textContent = s.current.title;
+    $("#np-artist").textContent = s.current.artist || "";
+    $("#np-img").src = s.current.thumb || "";
+    paused = s.paused;
+    if (!busy) {                     // while busy the play circle shows a spinner
       const pp = $("#playpause");
       pp.innerHTML = s.paused ? ICON_PLAY : ICON_PAUSE;
       pp.classList.toggle("is-play", s.paused);
-      syncProgress(s);
-      $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
-      renderProgress();
-    } else {
-      p.classList.remove("show");
-      npVid = null;
     }
-    if (tab === "queue") renderQueue(s);   // keep the queue view live
-  } catch (e) {}
+    syncProgress(s);
+    $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
+    renderProgress();
+  } else {
+    p.classList.remove("show");
+    npVid = null;
+  }
+  if (tab === "queue") renderQueue(s);   // keep the queue view live
+}
+
+// Press feedback: spin the play circle and lock the controls until the action
+// returns, so a tap is obviously registered and can't be double-fired.
+let busy = false;
+function setBusy(on) {
+  busy = on;
+  $(".ctrls").classList.toggle("busy", on);
+  if (on) {
+    const pp = $("#playpause");
+    pp.classList.remove("is-play");
+    pp.innerHTML = '<span class="spinner"></span>';
+  }
+}
+async function action(path, body) {
+  if (busy) return;                  // ignore taps while one is in flight
+  setBusy(true);
+  let s;
+  try { s = await post(path, body); } catch (e) {}
+  setBusy(false);
+  if (s) applyStatus(s);             // reflect the new state immediately
+}
+
+async function poll() {
+  try { applyStatus(await api("status")); } catch (e) {}
   setTimeout(poll, 2000);
 }
 // --- account / cookie upload ---

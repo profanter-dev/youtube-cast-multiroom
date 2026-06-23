@@ -301,11 +301,12 @@ authBtn.onclick = () => { renderAuth(); authModal.classList.add("show"); };
 authModal.onclick = e => { if (e.target === authModal) closeAuth(); };
 
 const HOWTO = `<p>Your library, playlists and playback all use one <b>cookies.txt</b>
-  from a browser logged into YouTube Music:</p>
-  <p>1. Open <b>music.youtube.com</b> and confirm you’re logged in (your avatar shows).<br>
-  2. Install the “<b>Get cookies.txt LOCALLY</b>” browser extension.<br>
-  3. On that tab, click the extension → <b>Export</b> (current site).<br>
-  4. Pick the file below.</p>`;
+  from a browser logged into YouTube Music. Export it from a
+  <b>private/incognito window</b> so Google doesn’t rotate (and invalidate) it:</p>
+  <p>1. Install the “<b>Get cookies.txt LOCALLY</b>” browser extension.<br>
+  2. Open an <b>incognito window</b> → <b>music.youtube.com</b> → log in (avatar shows).<br>
+  3. Click the extension → <b>Export</b> (current site).<br>
+  4. <b>Close incognito WITHOUT signing out</b>, then pick the file below.</p>`;
 
 function renderAuth() {
   const connected = authMethod !== "none";

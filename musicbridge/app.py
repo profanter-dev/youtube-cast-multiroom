@@ -440,26 +440,32 @@ def api_auth_start():
 @app.post("/api/auth/poll")
 def api_auth_poll():
     creds = oauth_credentials()
+    # Hold the lock across the whole exchange so concurrent polls serialize: the
+    # first one redeems the (single-use) device code; any others then see it
+    # cleared and return "idle" instead of redeeming it again and getting the
+    # spurious invalid_grant that would clobber the success.
     with _auth_lock:
         device_code = _auth_flow.get("device_code")
-    if not creds or not device_code:
-        return jsonify({"status": "idle"})
-    try:
-        raw = creds.token_from_code(device_code)
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"status": "error", "error": str(exc)})
-    if raw.get("access_token"):
-        token = RefreshingToken(credentials=creds, **raw)
-        token.store_token(OAUTH_FILE)
-        with _auth_lock:
+        if not creds or not device_code:
+            return jsonify({"status": "idle"})
+        try:
+            raw = creds.token_from_code(device_code)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"status": "error", "error": str(exc)})
+        if raw.get("access_token"):
+            token = RefreshingToken(credentials=creds, **raw)
+            token.store_token(OAUTH_FILE)
             _auth_flow.clear()
-        reset_ytmusic()
-        print(f"[ytm] OAuth token stored at {OAUTH_FILE}", flush=True)
-        return jsonify({"status": "connected"})
-    err = raw.get("error")
-    if err in ("authorization_pending", "slow_down"):
-        return jsonify({"status": "pending"})
-    return jsonify({"status": "error", "error": err or "unknown error"})
+            reset_ytmusic()
+            print(f"[ytm] OAuth token stored at {OAUTH_FILE}", flush=True)
+            return jsonify({"status": "connected"})
+        err = raw.get("error")
+        if err in ("authorization_pending", "slow_down"):
+            return jsonify({"status": "pending"})
+        # Hard error (expired/invalid code) — drop it so we stop hammering and
+        # the user can cleanly start over.
+        _auth_flow.clear()
+        return jsonify({"status": "error", "error": err or "unknown error"})
 
 
 @app.post("/api/auth/logout")

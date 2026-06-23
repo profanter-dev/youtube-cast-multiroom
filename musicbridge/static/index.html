@@ -348,6 +348,7 @@ async function startAuth() {
   pollTimer = setInterval(async () => {
     let r;
     try { r = await post("auth/poll"); } catch (e) { return; }
+    if (!pollTimer) return;            // a sibling poll already finished the flow
     const st = $("#authState");
     if (r.status === "connected") {
       clearInterval(pollTimer); pollTimer = null;

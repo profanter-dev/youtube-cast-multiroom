@@ -1,17 +1,23 @@
 services:
-  castbridge:
+  musicbridge:
     build:
-      context: ./castbridge
+      context: ./musicbridge
       dockerfile: Dockerfile
-    container_name: castbridge
+    container_name: musicbridge
     restart: unless-stopped
-    network_mode: host
-    environment:
-      - DEVICE_NAME=${DEVICE_NAME:-Multiroom}
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
-      - ${DATA_DIR}/certs:/certs
-      - /etc/avahi/services:/etc/avahi/services
+      - ${DATA_DIR}/musicbridge:/data
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.music.rule=Host(`${MUSIC_HOST}`)"
+      - traefik.http.routers.music.entrypoints=websecure
+      - traefik.http.routers.music.tls=true
+      - traefik.http.routers.music.tls.certresolver=letsencrypt
+      - traefik.http.routers.music.service=music
+      - traefik.http.services.music.loadbalancer.server.port=8080
 
   snapserver:
     build:
@@ -20,7 +26,7 @@ services:
     container_name: snapserver
     restart: unless-stopped
     depends_on:
-      - castbridge
+      - musicbridge
     ports:
       - "1704:1704"
       - "1705:1705"
@@ -31,12 +37,13 @@ services:
     networks:
       - traefik
     labels:
-      - "traefik.enable=true"
+      - traefik.enable=true
       - "traefik.http.routers.snapcast.rule=Host(`${SNAPCAST_HOST}`)"
-      - "traefik.http.routers.snapcast.tls=true"
-      - "traefik.http.routers.snapcast.tls.certresolver=porkbun"
-      - "traefik.http.routers.snapcast.entrypoints=websecure"
-      - "traefik.http.services.snapcast.loadbalancer.server.port=1780"
+      - traefik.http.routers.snapcast.entrypoints=websecure
+      - traefik.http.routers.snapcast.tls=true
+      - traefik.http.routers.snapcast.tls.certresolver=letsencrypt
+      - traefik.http.routers.snapcast.service=snapcast
+      - traefik.http.services.snapcast.loadbalancer.server.port=1780
 
 networks:
   traefik:

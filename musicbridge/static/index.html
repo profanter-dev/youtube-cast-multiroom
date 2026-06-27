@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Multiroom</title>
+<style>
+  :root { --bg:#0f0f14; --card:#1b1b24; --accent:#ff4356; --txt:#f2f2f5; --dim:#9a9aa6; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--txt); padding-bottom:150px; }
+  header { position:sticky; top:0; background:var(--bg); padding:12px 14px 6px; z-index:5; }
+  h1 { font-size:18px; margin:0 0 10px; }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; }
+  .tabs button { flex:1; background:var(--card); color:var(--dim); border:0; padding:9px;
+                 border-radius:10px; font-size:14px; }
+  .tabs button.active { color:var(--txt); background:var(--accent); }
+  #search { width:100%; padding:11px 14px; border-radius:12px; border:0; font-size:15px;
+            background:var(--card); color:var(--txt); }
+  .list { padding:6px 10px; }
+  .row { display:flex; align-items:center; gap:10px; padding:8px; border-radius:10px; }
+  .row:active { background:var(--card); }
+  .row img { width:46px; height:46px; border-radius:6px; object-fit:cover; background:var(--card); flex:0 0 auto; }
+  .meta { flex:1; min-width:0; }
+  .meta .t { font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .meta .a { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .q { background:none; border:0; color:var(--dim); padding:4px 8px;
+            display:flex; align-items:center; }
+  .row .q svg { display:block; }
+  .hint { color:var(--dim); font-size:13px; padding:18px 14px; text-align:center; }
+  .bar { display:flex; gap:8px; padding:4px 12px 8px; }
+  .bar button { flex:1; background:var(--card); color:var(--txt); border:0; padding:10px;
+                border-radius:10px; font-size:14px; }
+  .bar button.ghost { background:none; color:var(--dim); flex:0 0 auto; }
+  #player { position:fixed; left:0; right:0; bottom:0; background:var(--card);
+            padding:10px 14px calc(10px + env(safe-area-inset-bottom)); display:none; }
+  #player.show { display:block; }
+  .np { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .np img { width:42px; height:42px; border-radius:6px; object-fit:cover; }
+  .npvol { background:none; border:0; color:var(--dim); padding:6px; flex:0 0 auto;
+           display:flex; align-items:center; }
+  .npvol svg { display:block; }
+  .npvol:active { color:var(--accent); }
+  .prog { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .prog .time { font-size:11px; color:var(--dim); width:34px; text-align:center; flex:0 0 auto; }
+  .track { flex:1; height:4px; border-radius:2px; background:#33333f; overflow:hidden; }
+  .track > i { display:block; height:100%; width:0; background:var(--accent); }
+  .ctrls { display:flex; justify-content:center; align-items:center; gap:14px; }
+  .ctrls button { background:none; border:0; color:var(--txt); padding:2px;
+                  display:flex; align-items:center; justify-content:center; }
+  .ctrls button svg { display:block; }
+  .ctrls .play { background:var(--accent); width:50px; height:50px; border-radius:50%; }
+  /* a play triangle looks left-heavy in a circle; nudge it to optically center */
+  .ctrls .play.is-play svg { transform:translateX(2px); }
+  /* shuffle/repeat tint to show on/off state */
+  .ctrls .toggle { color:var(--dim); padding:6px; transition:color .15s; }
+  .ctrls .toggle.on { color:var(--accent); }
+  /* busy: lock the controls and spin the play circle while an action runs */
+  .ctrls.busy button { pointer-events:none; }
+  .ctrls.busy .toggle, .ctrls.busy #prev, .ctrls.busy #next, .ctrls.busy #stop { opacity:.4; }
+  .spinner { width:22px; height:22px; border:3px solid rgba(255,255,255,.35);
+             border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .top h1 { margin:0; }
+  .hdr-btns { display:flex; gap:8px; flex:0 0 auto; }
+  .vrow { display:flex; align-items:center; gap:10px; margin:12px 0; }
+  .vrow .vn { flex:0 0 96px; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .vrow input[type=range] { flex:1; accent-color:var(--accent); min-width:0; }
+  .vrow .vp { flex:0 0 38px; text-align:right; font-size:12px; color:var(--dim); }
+  .vrow.off { opacity:.4; }
+  .vhr { border:0; border-top:1px solid #2a2a35; margin:14px 0; }
+  .acct { background:var(--card); color:var(--dim); border:0; border-radius:8px; padding:6px 12px; font-size:13px; }
+  .acct.ok { color:#4ade80; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
+           align-items:center; justify-content:center; z-index:20; padding:20px; }
+  .modal.show { display:flex; }
+  .sheet { background:var(--card); border-radius:14px; padding:20px; max-width:360px; width:100%; }
+  .sheet h2 { margin:0 0 10px; font-size:17px; }
+  .sheet p { color:var(--dim); font-size:13px; line-height:1.5; margin:8px 0; }
+  .sheet b { color:var(--txt); }
+  .code { font-size:30px; letter-spacing:4px; text-align:center; font-weight:700;
+          background:var(--bg); padding:14px; border-radius:10px; margin:12px 0; }
+  .sheet a.btn, .sheet button.btn { display:block; width:100%; text-align:center; box-sizing:border-box;
+        background:var(--accent); color:#fff; border:0; border-radius:10px; padding:12px;
+        font-size:15px; text-decoration:none; margin-top:8px; }
+  .sheet button.sec { background:none; color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <div class="top"><h1><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:7px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Multiroom</h1><button id="account" class="acct">Account</button></div>
+  <div class="tabs">
+    <button data-tab="search" class="active">Search</button>
+    <button data-tab="library">Liked</button>
+    <button data-tab="playlists">Playlists</button>
+    <button data-tab="queue">Queue</button>
+  </div>
+  <input id="search" placeholder="Search YouTube Music…" autocomplete="off" />
+</header>
+
+<div id="actionbar" class="bar" style="display:none"></div>
+<div id="list" class="list"></div>
+
+<div id="player">
+  <div class="np">
+    <img id="np-img" src="" alt="" />
+    <div class="meta"><div class="t" id="np-title">—</div><div class="a" id="np-artist"></div></div>
+    <button id="volume" class="npvol" title="Volume"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg></button>
+  </div>
+  <div class="prog">
+    <span class="time" id="t-cur">0:00</span>
+    <div class="track"><i id="t-fill"></i></div>
+    <span class="time" id="t-dur">0:00</span>
+  </div>
+  <div class="ctrls">
+    <button id="shuffle" class="toggle" title="Shuffle"></button>
+    <button id="prev" title="Previous"></button>
+    <button id="playpause" class="play" title="Play/Pause"></button>
+    <button id="next" title="Next"></button>
+    <button id="repeat" class="toggle" title="Repeat"></button>
+    <button id="stop" title="Stop"></button>
+  </div>
+</div>
+
+<div id="authModal" class="modal"><div class="sheet" id="authSheet"></div></div>
+<div id="volModal" class="modal"><div class="sheet" id="volSheet"></div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const listEl = $("#list");
+const actionEl = $("#actionbar");
+let tab = "search";
+let lastTracks = [];   // tracks currently shown (for "Play all" / "Shuffle play")
+
+async function api(path, opts) {
+  const r = await fetch("/api/" + path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return r.json();
+}
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: body ? JSON.stringify(body) : null,
+});
+const esc = s => (s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const fmt = s => { s = Math.max(0, s|0); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
+function flash(b){ b.innerHTML = ICON_CHECK; setTimeout(()=>{ b.innerHTML = ICON_PLUS; }, 700); }
+
+function showActions(buttons) {
+  if (!buttons) { actionEl.style.display = "none"; actionEl.innerHTML = ""; return; }
+  actionEl.style.display = "flex";
+  actionEl.innerHTML = "";
+  buttons.forEach(b => {
+    const el = document.createElement("button");
+    el.innerHTML = b.label;   // labels are static, controlled strings (may hold an SVG)
+    if (b.ghost) el.className = "ghost";
+    el.onclick = b.onclick;
+    actionEl.appendChild(el);
+  });
+}
+
+function render(tracks, emptyMsg) {
+  lastTracks = tracks;
+  if (!tracks.length) { listEl.innerHTML = `<div class="hint">${emptyMsg}</div>`; return; }
+  listEl.innerHTML = "";
+  tracks.forEach(t => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <img src="${t.thumb || ""}" />
+      <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
+      <button class="q">${ICON_PLUS}</button>`;
+    row.querySelector("img").onclick = row.querySelector(".meta").onclick = () => play("play", t);
+    row.querySelector(".q").onclick = e => { e.stopPropagation(); post("queue", t); flash(e.currentTarget); };
+    listEl.appendChild(row);
+  });
+}
+
+// Buttons that play an entire shown list (playlist / library / search results).
+function listPlayActions(tracks) {
+  return [
+    { label: LBL_PLAYALL, onclick: () => play("play_tracks", { tracks, shuffle: false }) },
+    { label: LBL_SHUFFLE, onclick: () => play("play_tracks", { tracks, shuffle: true }) },
+  ];
+}
+
+// --- tabs ---
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  tab = b.dataset.tab;
+  $("#search").style.display = tab === "search" ? "block" : "none";
+  loadTab();
+});
+
+async function loadTab() {
+  showActions(null);
+  listEl.innerHTML = `<div class="hint">Loading…</div>`;
+  try {
+    if (tab === "library") {
+      const songs = await api("library");
+      render(songs, "No liked music yet — or connect your account via the Account button.");
+      if (songs.length) showActions(listPlayActions(songs));
+    } else if (tab === "playlists") {
+      renderPlaylists(await api("playlists"));
+    } else if (tab === "queue") {
+      renderQueue(await api("status"));
+    } else {
+      listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`;
+    }
+  } catch (e) { listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+}
+
+function renderPlaylists(pls) {
+  if (!pls.length) { listEl.innerHTML = `<div class="hint">No playlists — connect your account via the Account button.</div>`; return; }
+  listEl.innerHTML = "";
+  pls.forEach(p => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<img src="${p.thumb || ""}" /><div class="meta"><div class="t">${esc(p.title)}</div></div>`;
+    row.onclick = async () => {
+      showActions(null);
+      listEl.innerHTML = `<div class="hint">Loading…</div>`;
+      const data = await api("playlist/" + p.playlistId);
+      render(data.tracks, "Empty playlist.");
+      if (data.tracks.length) {
+        showActions([
+          ...listPlayActions(data.tracks),
+          { label: ICON_BACK, ghost: true, onclick: () => loadTab() },
+        ]);
+      }
+    };
+    listEl.appendChild(row);
+  });
+}
+
+function renderQueue(s) {
+  showActions(null);
+  const items = s.queue || [];
+  if (!items.length) { listEl.innerHTML = `<div class="hint">Queue is empty. Tap the + on a track, or “Play all” a playlist.</div>`; return; }
+  showActions([{ label: LBL_CLEAR, onclick: async () => renderQueue(await post("queue/clear")) }]);
+  listEl.innerHTML = "";
+  items.forEach((t, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <img src="${t.thumb || ""}" />
+      <div class="meta"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
+      <button class="q">${ICON_X}</button>`;
+    row.querySelector(".q").onclick = async () => renderQueue(await post("queue/remove", { index: i }));
+    listEl.appendChild(row);
+  });
+}
+
+// --- search (debounced) ---
+let timer;
+$("#search").addEventListener("input", e => {
+  clearTimeout(timer);
+  const q = e.target.value.trim();
+  showActions(null);
+  if (!q) { listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
+  timer = setTimeout(async () => {
+    try {
+      const songs = await api("search?q=" + encodeURIComponent(q));
+      render(songs, "No results.");
+      if (songs.length) showActions(listPlayActions(songs));
+    } catch (err) { listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
+  }, 350);
+});
+
+// --- transport ---
+$("#prev").onclick = () => action("prev", null, true);
+$("#next").onclick = () => action("next", null, true);
+$("#stop").onclick = () => action("stop");
+$("#playpause").onclick = () => action(paused ? "resume" : "pause");
+$("#shuffle").onclick = () => action("shuffle", { on: !shuffle });
+$("#repeat").onclick = () =>
+  action("repeat", { mode: { off: "all", all: "one", one: "off" }[repeat] || "off" });
+
+// Inline SVG icons (inherit `color`, so they tint by state and match the bar).
+const P_SHUFFLE = `<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>`;
+const P_REPEAT = `<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>`;
+const P_TRASH = `<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`;
+const stroke = (b, s) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${b}</svg>`;
+const fill = (b, s) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor">${b}</svg>`;
+const ICON_SHUFFLE = stroke(P_SHUFFLE, 22);
+const ICON_REPEAT = stroke(P_REPEAT, 22);
+const ICON_REPEAT1 = stroke(P_REPEAT + `<path d="M11 10h1v4"/>`, 22);
+// Filled transport icons.
+const ICON_PREV = fill(`<path d="M7 6h2.2v12H7z"/><path d="M20 6v12l-9.5-6z"/>`, 22);
+const ICON_NEXT = fill(`<path d="M14.8 6H17v12h-2.2z"/><path d="M4 6v12l9.5-6z"/>`, 22);
+const ICON_STOP = fill(`<rect x="6" y="6" width="12" height="12" rx="2"/>`, 19);
+const ICON_PLAY = fill(`<path d="M7 5v14l12-7z"/>`, 24);
+const ICON_PAUSE = fill(`<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>`, 24);
+const ICON_PLUS = stroke(`<path d="M12 5v14M5 12h14"/>`, 20);
+const ICON_CHECK = stroke(`<path d="M5 12.5l4.5 4.5L19 6.5"/>`, 20);
+const ICON_X = stroke(`<path d="M6 6l12 12M18 6 6 18"/>`, 18);
+const ICON_BACK = stroke(`<path d="M9 14 4 9l5-5"/><path d="M4 9h11a4 4 0 0 1 4 4v4"/>`, 18);
+// Leading icons for text buttons (inline, sized to the label).
+const lead = (svg) => `<span style="display:inline-block;vertical-align:-3px;margin-right:6px">${svg}</span>`;
+const LBL_PLAYALL = lead(fill(`<path d="M8 5v14l11-7z"/>`, 14)) + "Play all";
+const LBL_SHUFFLE = lead(stroke(P_SHUFFLE, 15)) + "Shuffle play";
+const LBL_CLEAR = lead(stroke(P_TRASH, 15)) + "Clear queue";
+$("#shuffle").innerHTML = ICON_SHUFFLE;
+$("#repeat").innerHTML = ICON_REPEAT;
+$("#prev").innerHTML = ICON_PREV;
+$("#next").innerHTML = ICON_NEXT;
+$("#stop").innerHTML = ICON_STOP;
+$("#playpause").innerHTML = ICON_PAUSE;
+
+let paused = false, shuffle = false, repeat = "off";
+let playing = false, npDur = 0, npVid = null;
+// Monotonic local clock: displayed = anchorElapsed + time since anchorTime.
+let anchorElapsed = 0, anchorTime = 0;
+
+function displayedElapsed() {
+  let cur = paused ? anchorElapsed : anchorElapsed + (performance.now() - anchorTime) / 1000;
+  if (npDur) cur = Math.min(cur, npDur);
+  return Math.max(0, cur);
+}
+function renderProgress() {
+  if (!playing) return;
+  const cur = displayedElapsed();
+  $("#t-cur").textContent = fmt(cur);
+  $("#t-fill").style.width = npDur ? Math.min(100, cur / npDur * 100) + "%" : "0%";
+}
+setInterval(renderProgress, 250);
+
+// Re-anchor only on real changes or >1s drift; ignore sub-second jitter so the
+// clock never ticks twice or jumps backward.
+function syncProgress(s) {
+  const trackChanged = s.current.videoId !== npVid;
+  npVid = s.current.videoId;
+  npDur = s.current.duration || 0;
+  const wasPaused = paused;
+  paused = s.paused;
+  const predicted = displayedElapsed();
+  const serverEl = s.elapsed || 0;
+  if (trackChanged || paused !== wasPaused || !anchorTime
+      || Math.abs(serverEl - predicted) > 1) {
+    anchorElapsed = serverEl;
+    anchorTime = performance.now();
+  }
+}
+
+// The play circle shows a spinner while a request is in flight (busy) OR while
+// the server is still starting a track's audio (loadingTrack); otherwise the
+// play/pause glyph.
+let busy = false, loadingTrack = false;
+function updatePlayButton() {
+  const pp = $("#playpause");
+  if (busy || (playing && loadingTrack)) {
+    pp.classList.remove("is-play");
+    if (!pp.querySelector(".spinner")) pp.innerHTML = '<span class="spinner"></span>';
+  } else {
+    pp.innerHTML = paused ? ICON_PLAY : ICON_PAUSE;
+    pp.classList.toggle("is-play", paused);
+  }
+}
+
+function applyStatus(s) {
+  const p = $("#player");
+  shuffle = s.shuffle; repeat = s.repeat;
+  loadingTrack = !!s.loading;
+  $("#shuffle").classList.toggle("on", shuffle);
+  const rb = $("#repeat");
+  rb.classList.toggle("on", repeat !== "off");
+  rb.innerHTML = repeat === "one" ? ICON_REPEAT1 : ICON_REPEAT;
+  playing = !!s.current;
+  if (s.current) {
+    p.classList.add("show");
+    $("#np-title").textContent = s.current.title;
+    $("#np-artist").textContent = s.current.artist || "";
+    $("#np-img").src = s.current.thumb || "";
+    paused = s.paused;
+    updatePlayButton();
+    syncProgress(s);
+    $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
+    renderProgress();
+  } else {
+    p.classList.remove("show");
+    npVid = null;
+  }
+  if (tab === "queue") renderQueue(s);   // keep the queue view live
+}
+
+// Press feedback: spin the play circle and lock the controls until the action
+// returns, so a tap is obviously registered and can't be double-fired.
+function setBusy(on) {
+  busy = on;
+  $(".ctrls").classList.toggle("busy", on);
+  updatePlayButton();
+}
+async function action(path, body, changesTrack) {
+  if (busy) return;                  // ignore taps while one is in flight
+  setBusy(true);
+  let s;
+  try { s = await post(path, body); } catch (e) {}
+  // For track changes, keep the spinner until the server actually starts audio.
+  if (changesTrack) loadingTrack = true;
+  setBusy(false);
+  if (s) applyStatus(s);
+  if (changesTrack) { loadingTrack = true; updatePlayButton(); }
+}
+
+// Start a new track (row tap / Play all): show the loading spinner right away.
+function play(path, body) {
+  loadingTrack = true; playing = true; updatePlayButton();
+  post(path, body).then(s => { if (s) applyStatus(s); loadingTrack = true; updatePlayButton(); })
+                  .catch(() => {});
+}
+
+async function poll() {
+  try { applyStatus(await api("status")); } catch (e) {}
+  setTimeout(poll, loadingTrack ? 350 : 2000);   // poll fast while a track loads
+}
+// --- account / cookie upload ---
+const authBtn = $("#account"), authModal = $("#authModal"), authSheet = $("#authSheet");
+let authMethod = "none";
+
+async function refreshAuth() {
+  try {
+    const s = await api("auth/status");
+    authMethod = s.method;
+    authBtn.textContent = authMethod === "none" ? "Connect" : "Account";
+    authBtn.classList.toggle("ok", authMethod !== "none");
+  } catch (e) {}
+}
+
+function closeAuth() { authModal.classList.remove("show"); }
+function bindClose() { const c = $("#closeAuth"); if (c) c.onclick = closeAuth; }
+authBtn.onclick = () => { renderAuth(); authModal.classList.add("show"); };
+authModal.onclick = e => { if (e.target === authModal) closeAuth(); };
+
+const HOWTO = `<p>Your library, playlists and playback all use one <b>cookies.txt</b>
+  from a browser logged into YouTube Music. Export it from a
+  <b>private/incognito window</b> so Google doesn’t rotate (and invalidate) it:</p>
+  <p>1. Install the “<b>Get cookies.txt LOCALLY</b>” browser extension.<br>
+  2. Open an <b>incognito window</b> → <b>music.youtube.com</b> → log in (avatar shows).<br>
+  3. Click the extension → <b>Export</b> (current site).<br>
+  4. <b>Close incognito WITHOUT signing out</b>, then pick the file below.</p>`;
+
+function renderAuth() {
+  const connected = authMethod !== "none";
+  authSheet.innerHTML = `<h2>${connected ? "Account" : "Connect your account"}</h2>
+    ${connected ? "<p>A cookie is loaded. Re-upload to refresh it when library/playlists go stale.</p>" : HOWTO}
+    <label class="btn" for="ckfile">${connected ? "Replace cookie" : "Choose cookies.txt"}</label>
+    <input id="ckfile" type="file" accept=".txt,text/plain" style="display:none">
+    <p id="authState"></p>
+    ${connected ? '<button class="btn sec" id="logout">Remove cookie</button>' : ""}
+    <button class="btn sec" id="closeAuth">Close</button>`;
+  bindClose();
+  $("#ckfile").onchange = uploadCookie;
+  const lo = $("#logout");
+  if (lo) lo.onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); loadTab(); };
+}
+
+async function uploadCookie(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const st = $("#authState");
+  st.textContent = "Uploading…";
+  const text = await file.text();
+  let r;
+  try {
+    r = await fetch("/api/cookies", { method: "POST", body: text });
+    r = await r.json();
+  } catch (err) { st.textContent = "Upload failed."; return; }
+  if (!r.ok) { st.textContent = "Couldn’t use that: " + (r.error || "rejected"); return; }
+  if (r.authenticated) {
+    st.textContent = `Logged in — found ${r.playlists} playlist(s).`;
+    await refreshAuth();
+    setTimeout(() => { closeAuth(); loadTab(); }, 1400);
+  } else {
+    st.textContent = "Saved, but this looks signed-out (0 playlists). "
+      + "Re-export while logged in to music.youtube.com.";
+    await refreshAuth();
+  }
+}
+
+// --- per-room volume (Snapcast) ---
+const volBtn = $("#volume"), volModal = $("#volModal"), volSheet = $("#volSheet");
+volBtn.onclick = openVol;
+volModal.onclick = e => { if (e.target === volModal) volModal.classList.remove("show"); };
+
+async function openVol() {
+  volModal.classList.add("show");
+  volSheet.innerHTML = `<h2>Volume</h2><p>Loading rooms…</p>`;
+  try {
+    renderVol(await api("snapcast/clients"));
+  } catch (e) {
+    volSheet.innerHTML = `<h2>Volume</h2><p>${esc(e.message)}</p>
+      <button class="btn sec" id="volClose">Close</button>`;
+    $("#volClose").onclick = () => volModal.classList.remove("show");
+  }
+}
+
+function renderVol(clients) {
+  const on = clients.filter(c => c.connected);
+  const avg = on.length ? Math.round(on.reduce((a, c) => a + c.percent, 0) / on.length) : 50;
+  let html = `<h2>Volume</h2>
+    <div class="vrow"><span class="vn"><b>All rooms</b></span>
+      <input type="range" min="0" max="100" value="${avg}" id="vAll">
+      <span class="vp" id="vAllP">${avg}%</span></div><hr class="vhr">`;
+  if (!clients.length) html += `<p>No Snapcast clients connected.</p>`;
+  clients.forEach((c, i) => {
+    html += `<div class="vrow ${c.connected ? "" : "off"}" data-i="${i}">
+      <span class="vn">${esc(c.name)}</span>
+      <input type="range" min="0" max="100" value="${c.percent}" ${c.connected ? "" : "disabled"}>
+      <span class="vp">${c.percent}%</span></div>`;
+  });
+  html += `<button class="btn sec" id="volClose">Close</button>`;
+  volSheet.innerHTML = html;
+  $("#volClose").onclick = () => volModal.classList.remove("show");
+
+  const rows = [...volSheet.querySelectorAll(".vrow[data-i]")];
+  const all = $("#vAll");
+  all.oninput = () => {
+    $("#vAllP").textContent = all.value + "%";
+    rows.forEach(r => { const inp = r.querySelector("input"); if (!inp.disabled) {
+      inp.value = all.value; r.querySelector(".vp").textContent = all.value + "%"; } });
+  };
+  all.onchange = () => post("snapcast/volume_all", { percent: +all.value }).catch(() => {});
+  rows.forEach(r => {
+    const c = clients[+r.dataset.i], inp = r.querySelector("input"), lbl = r.querySelector(".vp");
+    inp.oninput = () => { lbl.textContent = inp.value + "%"; };
+    inp.onchange = () => post("snapcast/volume", { id: c.id, percent: +inp.value }).catch(() => {});
+  });
+}
+
+refreshAuth();
+poll();
+loadTab();
+</script>
+</body>
+</html>

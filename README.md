@@ -59,15 +59,9 @@ curl -o .env https://raw.githubusercontent.com/profanter-dev/youtube-cast-multir
 # edit .env — DATA_DIR, MUSIC_HOST, SNAPCAST_HOST
 ```
 
-The packages are **private**, so log in once on the host with a GitHub PAT that has
-`read:packages`:
-
-```bash
-echo "$GITHUB_PAT" | docker login ghcr.io -u profanter-dev --password-stdin
-```
-
-(Making the packages public on github.com → *Packages* drops this step. They contain
-no secrets — your cookie lives in `$DATA_DIR`, never in an image.)
+Both packages are **public**, so the host needs no registry login — `docker compose
+pull` works anonymously. (They contain no secrets; your cookie lives in `$DATA_DIR`,
+never in an image.)
 
 > **Security:** the default compose adds **no authentication** — fine on a trusted LAN.
 > If you expose `MUSIC_HOST` to the internet, add a Traefik basic-auth middleware: set
@@ -161,7 +155,18 @@ docker push ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:$(date +%Y%
 
 > **Architecture:** musicbridge is **linux/amd64 only** — the `deno` download in its
 > Dockerfile is a hardcoded x86_64 build. Build it on an amd64 machine, or pass
-> `--platform linux/amd64`. (snapserver *is* arch-aware via `TARGETARCH`.)
+> `--platform linux/amd64`. (snapserver resolves its arch from `TARGETARCH`, falling
+> back to the build host's own architecture when BuildKit isn't in play.)
+
+> **Visibility:** both packages are public, so hosts pull without a login. GHCR
+> creates *new* packages as private regardless of the repository's visibility and
+> never inherits it, so if you ever push under a new image name, flip it at
+> `github.com/users/profanter-dev/packages` → the package → *Package settings* →
+> *Danger Zone* → *Change visibility*.
+
+Pushing links each package to this repository automatically, via the
+`org.opencontainers.image.source` label in both Dockerfiles — that's what makes them
+show up in the repo's **Packages** sidebar.
 
 Then, on the host:
 

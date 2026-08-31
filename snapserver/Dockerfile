@@ -20,6 +20,12 @@ RUN set -eux; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
+LABEL org.opencontainers.image.source=https://github.com/profanter-dev/youtube-cast-multiroom
+
+# Baked in (not bind-mounted) so a deployment host needs no checkout of this repo —
+# just docker-compose.yml + .env. snapserver reads this path by default.
+COPY snapserver.conf /etc/snapserver.conf
+
 EXPOSE 1704 1705 1780
 
 ENTRYPOINT ["/usr/bin/snapserver"]

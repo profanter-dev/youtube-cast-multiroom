@@ -1,9 +1,14 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source=https://github.com/profanter-dev/youtube-cast-multiroom
+
 # ffmpeg decodes the YouTube audio stream to raw PCM for the Snapcast FIFO.
 # deno is a JavaScript runtime yt-dlp uses to descramble YouTube signatures;
 # without it, extraction falls back to a limited client and many tracks fail
-# with "Requested format is not available". (x86_64 glibc build for Debian.)
+# with "Requested format is not available". The URL is x86_64-only, so this image is
+# linux/amd64 by construction — build it on an amd64 machine, or pass
+# --platform linux/amd64. For a real multi-arch build, switch on TARGETARCH here the
+# way snapserver/Dockerfile does.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates curl unzip \
     && curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \

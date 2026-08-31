@@ -1,8 +1,9 @@
+# Pull-only: the images are built and pushed to GHCR by hand from a dev machine
+# (see README → Publishing images to GHCR), so a deployment host needs nothing from
+# this repo except this file and a .env next to it.
 services:
   musicbridge:
-    build:
-      context: ./musicbridge
-      dockerfile: Dockerfile
+    image: ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:${TAG:-latest}
     container_name: musicbridge
     restart: unless-stopped
     volumes:
@@ -20,9 +21,7 @@ services:
       - traefik.http.services.music.loadbalancer.server.port=8080
 
   snapserver:
-    build:
-      context: ./snapserver
-      dockerfile: Dockerfile
+    image: ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:${TAG:-latest}
     container_name: snapserver
     restart: unless-stopped
     depends_on:
@@ -33,7 +32,9 @@ services:
       - "1780:1780"
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
-      - ./snapserver/snapserver.conf:/etc/snapserver.conf:ro
+      # snapserver.conf is baked into the image. Uncomment to override it from a
+      # local checkout (requires the repo on this host):
+      # - ./snapserver/snapserver.conf:/etc/snapserver.conf:ro
     networks:
       - traefik
     labels:

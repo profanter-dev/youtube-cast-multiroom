@@ -49,11 +49,25 @@ YouTube Music app's Cast button. That's unavoidable — YouTube Music exposes no
 
 ## Deploy
 
+Both images are published to GHCR, so the host runs **pull-only** — no clone, no
+build. It needs exactly two files:
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/youtube-cast-multiroom
-cd youtube-cast-multiroom
-cp .env.example .env          # edit DATA_DIR, MUSIC_HOST, SNAPCAST_HOST
+mkdir -p /opt/youtube-cast-multiroom && cd /opt/youtube-cast-multiroom
+curl -O  https://raw.githubusercontent.com/profanter-dev/youtube-cast-multiroom/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/profanter-dev/youtube-cast-multiroom/main/.env.example
+# edit .env — DATA_DIR, MUSIC_HOST, SNAPCAST_HOST
 ```
+
+The packages are **private**, so log in once on the host with a GitHub PAT that has
+`read:packages`:
+
+```bash
+echo "$GITHUB_PAT" | docker login ghcr.io -u profanter-dev --password-stdin
+```
+
+(Making the packages public on github.com → *Packages* drops this step. They contain
+no secrets — your cookie lives in `$DATA_DIR`, never in an image.)
 
 > **Security:** the default compose adds **no authentication** — fine on a trusted LAN.
 > If you expose `MUSIC_HOST` to the internet, add a Traefik basic-auth middleware: set
@@ -67,7 +81,7 @@ cp .env.example .env          # edit DATA_DIR, MUSIC_HOST, SNAPCAST_HOST
 ### 1. Start
 
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Open `https://<MUSIC_HOST>` in a browser. **Search** and playback work immediately —
@@ -118,25 +132,62 @@ The cookie is stored at `$DATA_DIR/musicbridge/cookies.txt`, and `browser.json`
 Repeat on every TV. Set volume from musicbridge's **speaker icon**, the Snapcast app,
 or the Snapweb UI at `https://<SNAPCAST_HOST>` (or `http://<host>:1780`).
 
-## Updating snapserver
+## Publishing images to GHCR
 
-Version is pinned in `snapserver/Dockerfile` (`SNAPCAST_VERSION`):
+There is no CI — images are built and pushed by hand from a dev machine.
 
-```bash
-docker compose build snapserver && docker compose up -d snapserver
-```
-
-To pick up a newer `yt-dlp` (YouTube changes break it periodically):
+1. Create a GitHub Personal Access Token (classic, or fine-grained with Packages
+   access) with the `write:packages` and `read:packages` scopes.
+2. Log in and push, from the repo root:
 
 ```bash
-docker compose build musicbridge && docker compose up -d musicbridge
+echo "$GITHUB_PAT" | docker login ghcr.io -u profanter-dev --password-stdin
+
+docker build -t ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest ./musicbridge
+docker push       ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest
+
+docker build -t ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest ./snapserver
+docker push       ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest
 ```
+
+To keep a rollback target, also tag the same build with the date and push it, then
+set `TAG=` in the host's `.env` to pin it:
+
+```bash
+docker tag  ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest \
+            ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:$(date +%Y%m%d)
+docker push ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:$(date +%Y%m%d)
+```
+
+> **Architecture:** musicbridge is **linux/amd64 only** — the `deno` download in its
+> Dockerfile is a hardcoded x86_64 build. Build it on an amd64 machine, or pass
+> `--platform linux/amd64`. (snapserver *is* arch-aware via `TARGETARCH`.)
+
+Then, on the host:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+## Updating
+
+Everything is a rebuild-and-push from the dev machine followed by a `pull` on the
+host — the host never builds anything.
+
+- **Newer `yt-dlp`** (YouTube changes break it periodically) — rebuild and push
+  `musicbridge`; the image installs the latest at build time.
+- **Newer snapserver** — bump `SNAPCAST_VERSION` in `snapserver/Dockerfile`, then
+  rebuild and push `snapserver`.
+- **Changed `snapserver.conf`** — it is baked into the image, so this also needs a
+  rebuild and push (or uncomment the bind-mount in `docker-compose.yml` if you have a
+  checkout on the host).
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
 | `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/cookies.txt` + generated `browser.json`). |
+| `TAG` | Image tag to pull for both services (default `latest`). Pin to a dated tag to roll back. |
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | *Optional* — `htpasswd` `user:hash` (double every `$`). Only used if you add the basic-auth middleware (see Security). |
@@ -155,7 +206,8 @@ and `YTDLP_USE_COOKIES` (default `0`).
   (the image bundles the `deno` JS runtime and yt-dlp runs *without* the cookie, so
   YouTube doesn't force SABR-only streams). If you instead see **"confirm you're not
   a bot"**, set `YTDLP_USE_COOKIES=1` and `docker compose up -d musicbridge`.
-- **Playback breaks after a YouTube change** — rebuild musicbridge to pull the
-  latest yt-dlp: `docker compose build musicbridge && docker compose up -d musicbridge`.
+- **Playback breaks after a YouTube change** — rebuild musicbridge on your dev
+  machine to pull the latest yt-dlp, push it (see *Publishing images to GHCR*), then
+  `docker compose pull musicbridge && docker compose up -d musicbridge` on the host.
 - **Volume panel says "snapserver unreachable"** — set `SNAPSERVER_CONTROL` to your
   snapserver's `host:port` if it isn't the default `snapserver:1705`.

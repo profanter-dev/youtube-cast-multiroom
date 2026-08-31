@@ -4,11 +4,15 @@ ARG SNAPCAST_VERSION=0.35.0
 ARG TARGETARCH
 
 RUN set -eux; \
-    case "${TARGETARCH}" in \
+    # TARGETARCH is supplied by BuildKit only. The legacy builder leaves it unset,
+    # which under `set -u` aborts the build — so fall back to the build host's own
+    # architecture, which is the right answer for any non-cross build.
+    ARCH="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${ARCH}" in \
         amd64) DEB_ARCH=amd64 ;; \
         arm64) DEB_ARCH=arm64 ;; \
-        arm)   DEB_ARCH=armhf ;; \
-        *) echo "Unsupported arch: ${TARGETARCH}"; exit 1 ;; \
+        arm|armhf) DEB_ARCH=armhf ;; \
+        *) echo "Unsupported arch: ${ARCH}"; exit 1 ;; \
     esac; \
     apt-get update; \
     apt-get install -y --no-install-recommends wget ca-certificates; \

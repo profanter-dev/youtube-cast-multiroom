@@ -130,7 +130,11 @@
 const $ = s => document.querySelector(s);
 const listEl = $("#list");
 const actionEl = $("#actionbar");
-let tab = "search";
+const TABS = ["search", "library", "playlists", "queue"];
+let tab = "search";    // mirrors ?tab= — the status poll reads this
+let curPl = null;      // playlistId while inside a playlist detail, else null
+let navToken = 0;      // bumped per navigation; async renders bail out if it moved
+let seq = 0;           // history entries this page pushed (0 = the one we loaded on)
 let lastTracks = [];   // tracks currently shown (for "Play all" / "Shuffle play")
 
 async function api(path, opts) {
@@ -185,31 +189,101 @@ function listPlayActions(tracks) {
   ];
 }
 
-// --- tabs ---
-document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
-  document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
-  b.classList.add("active");
-  tab = b.dataset.tab;
-  $("#search").style.display = tab === "search" ? "block" : "none";
-  loadTab();
-});
+// --- routing -------------------------------------------------------------
+// The URL is the source of truth for which tab is open, what was searched, and
+// which playlist you're inside, so a reload lands you back where you were and the
+// phone's Back button walks out of a playlist instead of out of the app.
+//
+// Invariant: only user-event handlers write history (go / the search debounce /
+// reload / the bootstrap). Render functions never do — that's what stops a
+// popstate-driven re-render from pushing entries in an endless loop.
 
-async function loadTab() {
+function urlFor() {
+  const p = new URLSearchParams();
+  p.set("tab", tab);
+  if (tab === "search") { const q = $("#search").value.trim(); if (q) p.set("q", q); }
+  if (tab === "playlists" && curPl) p.set("pl", curPl);
+  return "?" + p;
+}
+
+function writeUrl(push) {
+  const u = urlFor();
+  if (u === location.search) return;          // no duplicate / no-op entries
+  if (push) history.pushState({ seq: ++seq }, "", u);
+  else history.replaceState(history.state, "", u);
+}
+
+// URL -> globals. Assigning .value fires no `input` event, so restoring ?q= does
+// not re-trigger the debounced search below.
+function readUrl() {
+  const p = new URLSearchParams(location.search);
+  const t = p.get("tab");
+  tab = TABS.includes(t) ? t : "search";
+  curPl = tab === "playlists" ? (p.get("pl") || null) : null;
+  const q = tab === "search" ? (p.get("q") || "") : "";
+  if ($("#search").value !== q) $("#search").value = q;
+}
+
+function syncTabUi() {
+  document.querySelectorAll(".tabs button")
+    .forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  $("#search").style.display = tab === "search" ? "block" : "none";
+}
+
+// Render whatever the URL currently says. Never touches history.
+function applyRoute() {
+  readUrl();
+  clearTimeout(timer);              // drop a search debounced before this navigation
+  syncTabUi();
+  const my = ++navToken;            // invalidates every in-flight render
+  if (tab === "search") {
+    const q = $("#search").value.trim();
+    if (q) listEl.innerHTML = `<div class="hint">Loading…</div>`;
+    return runSearch(q, my);
+  }
+  if (tab === "playlists" && curPl) return openPlaylist(curPl, my);
+  return loadTab(my);
+}
+
+// A user-initiated navigation: set state, push an entry, render from the URL.
+function go(next) {
+  if (next.tab !== undefined) tab = next.tab;
+  if (next.pl !== undefined) curPl = next.pl;
+  writeUrl(true);
+  applyRoute();
+}
+
+// Re-render in place after an auth change. A playlist detail can't reload without
+// the cookie, so drop it — and replace rather than push: this isn't a navigation.
+function reload() { curPl = null; writeUrl(false); applyRoute(); }
+
+addEventListener("popstate", applyRoute);
+
+// --- tabs ---
+document.querySelectorAll(".tabs button").forEach(b =>
+  b.onclick = () => go({ tab: b.dataset.tab, pl: null }));
+
+async function loadTab(token = navToken) {
   showActions(null);
   listEl.innerHTML = `<div class="hint">Loading…</div>`;
   try {
     if (tab === "library") {
       const songs = await api("library");
+      if (token !== navToken) return;          // navigated away while fetching
       render(songs, "No liked music yet — or connect your account via the Account button.");
       if (songs.length) showActions(listPlayActions(songs));
     } else if (tab === "playlists") {
-      renderPlaylists(await api("playlists"));
+      const pls = await api("playlists");
+      if (token !== navToken) return;
+      renderPlaylists(pls);
     } else if (tab === "queue") {
-      renderQueue(await api("status"));
+      const s = await api("status");
+      if (token !== navToken) return;
+      renderQueue(s);
     } else {
       listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`;
     }
-  } catch (e) { listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+  } catch (e) { if (token === navToken) listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
 }
 
 function renderPlaylists(pls) {
@@ -219,20 +293,35 @@ function renderPlaylists(pls) {
     const row = document.createElement("div");
     row.className = "row";
     row.innerHTML = `<img src="${p.thumb || ""}" /><div class="meta"><div class="t">${esc(p.title)}</div></div>`;
-    row.onclick = async () => {
-      showActions(null);
-      listEl.innerHTML = `<div class="hint">Loading…</div>`;
-      const data = await api("playlist/" + p.playlistId);
-      render(data.tracks, "Empty playlist.");
-      if (data.tracks.length) {
-        showActions([
-          ...listPlayActions(data.tracks),
-          { label: ICON_BACK, ghost: true, onclick: () => loadTab() },
-        ]);
-      }
-    };
+    row.onclick = () => go({ pl: p.playlistId });
     listEl.appendChild(row);
   });
+}
+
+// Lives outside the row handler because ?pl= must be able to open a playlist cold,
+// with only the id — GET /api/playlist/<id> returns its title and tracks.
+async function openPlaylist(id, token) {
+  showActions(null);
+  listEl.innerHTML = `<div class="hint">Loading…</div>`;
+  const back = { label: ICON_BACK, ghost: true, onclick: backToPlaylists };
+  try {
+    const data = await api("playlist/" + encodeURIComponent(id));
+    if (token !== navToken) return;
+    render(data.tracks, "Empty playlist.");
+    showActions([...(data.tracks.length ? listPlayActions(data.tracks) : []), back]);
+  } catch (e) {
+    if (token !== navToken) return;
+    listEl.innerHTML = `<div class="hint">${esc(e.message)}</div>`;
+    showActions([back]);          // an empty or broken playlist must not strand you
+  }
+}
+
+function backToPlaylists() {
+  // state.seq is stamped only on entries this page pushed. Without one — a reload
+  // or a shared link straight into ?pl= — history.back() would leave the site, so
+  // swap the detail out in place instead.
+  if (history.state && history.state.seq) history.back();
+  else { curPl = null; writeUrl(false); applyRoute(); }
 }
 
 function renderQueue(s) {
@@ -254,19 +343,30 @@ function renderQueue(s) {
 }
 
 // --- search (debounced) ---
+// Deliberately does not clear the list first: old results stay put until the new
+// ones land, so typing doesn't flash. applyRoute() shows "Loading…" instead, since
+// there the list is stale by definition (reload or deep link).
+async function runSearch(q, token) {
+  showActions(null);
+  if (!q) { listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
+  try {
+    const songs = await api("search?q=" + encodeURIComponent(q));
+    if (token !== navToken) return;
+    render(songs, "No results.");
+    if (songs.length) showActions(listPlayActions(songs));
+  } catch (err) { if (token === navToken) listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
+}
+
 let timer;
 $("#search").addEventListener("input", e => {
   clearTimeout(timer);
   const q = e.target.value.trim();
+  const my = ++navToken;                 // also drops an earlier, slower response
   showActions(null);
-  if (!q) { listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
-  timer = setTimeout(async () => {
-    try {
-      const songs = await api("search?q=" + encodeURIComponent(q));
-      render(songs, "No results.");
-      if (songs.length) showActions(listPlayActions(songs));
-    } catch (err) { listEl.innerHTML = `<div class="hint">${esc(err.message)}</div>`; }
-  }, 350);
+  // Typing only ever replaces the entry, so one Back leaves the search, not the
+  // last twenty keystrokes.
+  if (!q) { writeUrl(false); listEl.innerHTML = `<div class="hint">Search your YouTube Music above.</div>`; return; }
+  timer = setTimeout(() => { writeUrl(false); runSearch(q, my); }, 350);
 });
 
 // --- transport ---
@@ -453,7 +553,7 @@ function renderAuth() {
   bindClose();
   $("#ckfile").onchange = uploadCookie;
   const lo = $("#logout");
-  if (lo) lo.onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); loadTab(); };
+  if (lo) lo.onclick = async () => { await post("auth/logout"); await refreshAuth(); renderAuth(); reload(); };
 }
 
 async function uploadCookie(e) {
@@ -471,7 +571,7 @@ async function uploadCookie(e) {
   if (r.authenticated) {
     st.textContent = `Logged in — found ${r.playlists} playlist(s).`;
     await refreshAuth();
-    setTimeout(() => { closeAuth(); loadTab(); }, 1400);
+    setTimeout(() => { closeAuth(); reload(); }, 1400);
   } else {
     st.textContent = "Saved, but this looks signed-out (0 playlists). "
       + "Re-export while logged in to music.youtube.com.";
@@ -531,7 +631,9 @@ function renderVol(clients) {
 
 refreshAuth();
 poll();
-loadTab();
+readUrl();          // globals from the URL first, so writeUrl doesn't clobber ?pl=
+writeUrl(false);    // canonicalize: bare / becomes ?tab=search, junk params drop
+applyRoute();
 </script>
 </body>
 </html>

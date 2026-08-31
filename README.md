@@ -144,8 +144,9 @@ docker build -t ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest .
 docker push       ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest
 ```
 
-To keep a rollback target, also tag the same build with the date and push it, then
-set `TAG=` in the host's `.env` to pin it:
+To keep a rollback target, also tag the same build with the date and push it. To
+roll back, point the `image:` line in the host's `docker-compose.yml` at that tag
+instead of `:latest`:
 
 ```bash
 docker tag  ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest \
@@ -192,7 +193,6 @@ host — the host never builds anything.
 | Variable | Description |
 |---|---|
 | `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/cookies.txt` + generated `browser.json`). |
-| `TAG` | Image tag to pull for both services (default `latest`). Pin to a dated tag to roll back. |
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | *Optional* — `htpasswd` `user:hash` (double every `$`). Only used if you add the basic-auth middleware (see Security). |

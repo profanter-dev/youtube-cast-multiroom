@@ -3,7 +3,7 @@
 # this repo except this file and a .env next to it.
 services:
   musicbridge:
-    image: ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:${TAG:-latest}
+    image: ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest
     container_name: musicbridge
     restart: unless-stopped
     volumes:
@@ -21,7 +21,7 @@ services:
       - traefik.http.services.music.loadbalancer.server.port=8080
 
   snapserver:
-    image: ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:${TAG:-latest}
+    image: ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest
     container_name: snapserver
     restart: unless-stopped
     depends_on:

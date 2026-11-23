@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Multiroom fork: full-screen Now Playing for TVs. GPL-3.0, like the rest of Snapdroid. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0a0a0f"
+    android:keepScreenOn="true">
+
+    <!-- The tiny (60px) thumbnail stretched full-screen: blurry by itself; on
+         Android 12+ additionally blurred with RenderEffect. -->
+    <ImageView
+        android:id="@+id/np_bg"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:alpha="0.55"
+        android:importantForAccessibility="no"
+        android:scaleType="centerCrop" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/np_scrim" />
+
+    <LinearLayout
+        android:id="@+id/np_content"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="72dp"
+        android:paddingEnd="72dp">
+
+        <ImageView
+            android:id="@+id/np_cover"
+            android:layout_width="300dp"
+            android:layout_height="300dp"
+            android:background="#1d1d27"
+            android:elevation="24dp"
+            android:importantForAccessibility="no"
+            android:scaleType="centerCrop" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="56dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/np_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:letterSpacing="0.15"
+                android:text="@string/np_now_playing"
+                android:textAllCaps="true"
+                android:textColor="#ff5a6e"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/np_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:ellipsize="end"
+                android:fontFamily="sans-serif-medium"
+                android:maxLines="2"
+                android:textColor="#f4f4f7"
+                android:textSize="40sp" />
+
+            <TextView
+                android:id="@+id/np_artist"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="#b4b4c4"
+                android:textSize="24sp" />
+
+            <ProgressBar
+                android:id="@+id/np_progress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="6dp"
+                android:layout_marginTop="36dp"
+                android:max="1000"
+                android:progressDrawable="@drawable/np_progress" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/np_elapsed"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFeatureSettings="tnum"
+                    android:textColor="#9d9dad"
+                    android:textSize="16sp" />
+
+                <TextView
+                    android:id="@+id/np_duration"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFeatureSettings="tnum"
+                    android:textColor="#9d9dad"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/np_next"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="28dp"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="#7d7d8d"
+                android:textSize="16sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/np_hint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="28dp"
+        android:text="@string/np_hint"
+        android:textIsSelectable="false"
+        android:textColor="#5d5d6d"
+        android:textSize="13sp" />
+</FrameLayout>

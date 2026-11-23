@@ -157,6 +157,13 @@ and kept in `$DATA_DIR/musicbridge/cookie_state.json`. When it does expire, re-e
 
 ## Install the Snapcast app on each Google TV
 
+**Recommended:** the **Multiroom** TV app in [`android/`](android/) — a Snapdroid
+fork that plays the stream like the official app and also shows a full-screen
+*Now Playing* (artwork, title, progress) that opens by itself when music starts.
+See [`android/README.md`](android/README.md) for building and installing it via adb.
+
+Or use the official app:
+
 1. Install the **Snapcast** Android client (by badaix) — from the Play Store if
    available, otherwise sideload the APK from the [Snapcast releases](https://github.com/badaix/snapcast/releases).
 2. Open it, add a server, and enter the **IP of the Docker host** (the snapserver

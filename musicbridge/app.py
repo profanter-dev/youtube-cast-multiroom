@@ -17,6 +17,7 @@ import itertools
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -68,10 +69,17 @@ YTDLP_USE_COOKIES = os.environ.get("YTDLP_USE_COOKIES", "0") == "1"
 # Cookie keeper (see the "Cookie keeper" section below).
 # When the nightly check + refresh runs, in the container's local time (set TZ).
 COOKIE_REFRESH_AT = os.environ.get("COOKIE_REFRESH_AT", "04:00")
-# The endpoint a signed-in YouTube page calls every ~10 min to rotate the
-# short-lived __Secure-*PSIDTS session tokens. Undocumented; overridable for tests.
+# What a signed-in YouTube page does every ~10 min to rotate the short-lived
+# __Secure-*PSIDTS session tokens: load RotateCookiesPage (hidden iframe) for a
+# one-time token, then POST it to RotateCookies. Undocumented; overridable for tests.
+COOKIE_ROTATE_PAGE_URL = os.environ.get(
+    "COOKIE_ROTATE_PAGE_URL",
+    "https://accounts.youtube.com/RotateCookiesPage?origin=https://www.youtube.com&yt_pid=1")
 COOKIE_ROTATE_URL = os.environ.get("COOKIE_ROTATE_URL",
                                    "https://accounts.youtube.com/RotateCookies")
+# Google answers bare scripted requests differently; look like the browser it is.
+BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
 # Google answers a second rotation within ~10 min with 429, so never rotate more
 # often than this — protects against restart loops.
 COOKIE_ROTATE_MIN_INTERVAL = int(os.environ.get("COOKIE_ROTATE_MIN_INTERVAL", "900"))
@@ -409,30 +417,67 @@ def _set_cookies(resp: requests.Response) -> list:
 
 
 def rotate_cookies() -> str:
-    """Ask Google for fresh __Secure-*PSIDTS tokens, like an open YouTube tab does
-    every ~10 min, and store them. Returns 'ok …' | 'expired …' | 'error: …'."""
-    cookie_str = "; ".join(f"{k}={v}" for k, v in parse_cookies_txt(COOKIES_FILE).items())
+    """Ask Google for fresh __Secure-*PSIDTS tokens the way an open YouTube tab
+    does, and store them. Returns 'ok …' | 'rejected …' | 'error: …'.
+
+    1. GET RotateCookiesPage with the session -> HTML holding
+       init('<token>', m, o, l, interval)
+    2. POST [m, token, o, l] (zeros as null) to RotateCookies -> Set-Cookie.
+    A bare POST without the token gets 403 even for a valid session."""
+    cookies = parse_cookies_txt(COOKIES_FILE)
+    header = lambda: "; ".join(f"{k}={v}" for k, v in cookies.items())  # noqa: E731
+    base = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+    changed = 0
+
+    def absorb(resp) -> int:
+        got = _set_cookies(resp)
+        # Send them on (incl. host-only accounts.youtube.com ones, like a
+        # browser would); merge_cookies persists only the .youtube.com ones.
+        cookies.update({c.name: c.value for c in got
+                        if c.domain.lstrip(".").endswith("youtube.com")})
+        return merge_cookies(got)
+
     try:
-        resp = requests.post(
-            COOKIE_ROTATE_URL,
-            data='[000,"-0000000000000000000"]',
-            headers={"Content-Type": "application/json",
-                     "Origin": "https://accounts.youtube.com",
-                     "Cookie": cookie_str},
-            timeout=20,
-        )
+        page = requests.get(COOKIE_ROTATE_PAGE_URL, timeout=20, headers={
+            **base, "Accept": "text/html,*/*", "Referer": "https://www.youtube.com/",
+            "Cookie": header()})
+        if page.status_code in (401, 403):
+            return f"rejected (page HTTP {page.status_code})"
+        if not page.ok:
+            return f"error: page HTTP {page.status_code}"
+        changed += absorb(page)
+        m = re.search(r"""init\(\s*['"]([^'"]+)['"]\s*,\s*([-\d.eE]+)\s*,"""
+                      r"""\s*([-\d.eE]+)\s*,\s*([-\d.eE]+)""", page.text)
+        if not m:
+            return "error: no rotation token in RotateCookiesPage"
+
+        def num(x):
+            v = float(x)
+            return None if v == 0 else (int(v) if v.is_integer() else v)
+
+        body = [num(m.group(2)), m.group(1), num(m.group(3)), num(m.group(4))]
+        resp = requests.post(COOKIE_ROTATE_URL, data=json.dumps(body), timeout=20, headers={
+            **base, "Accept": "*/*", "Content-Type": "application/json",
+            "Origin": "https://accounts.youtube.com",
+            "Referer": "https://accounts.youtube.com/RotateCookiesPage",
+            "Cookie": header()})
     except requests.RequestException as exc:
         return f"error: {exc.__class__.__name__}: {exc}"[:200]
-    if resp.status_code in (401, 403):     # 403 is what a dead session gets today
-        return f"expired (HTTP {resp.status_code})"
+    finally:
+        if changed:
+            build_browser_json()
+            reset_ytmusic()
+    if resp.status_code in (401, 403):
+        return f"rejected (HTTP {resp.status_code})"
     if not resp.ok:
         return f"error: HTTP {resp.status_code}"
-    changed = merge_cookies(_set_cookies(resp))
-    _cookie_state["rotated_at"] = _now().isoformat()
-    _cookie_state["rotations"] = _cookie_state.get("rotations", 0) + 1
-    if changed:
+    n = absorb(resp)
+    changed += n
+    if n:
         build_browser_json()
         reset_ytmusic()
+    _cookie_state["rotated_at"] = _now().isoformat()
+    _cookie_state["rotations"] = _cookie_state.get("rotations", 0) + 1
     return f"ok ({changed} cookie(s) updated)"
 
 
@@ -477,7 +522,7 @@ def maintain_cookie(reason: str, rotate: bool = True) -> dict:
             _cookie_state["playlists"] = probe.get("playlists", 0)
             _cookie_state.pop("expired_at", None)
             _cookie_state.pop("error", None)
-        elif probe.get("authenticated") is None and not rot.startswith("expired"):
+        elif probe.get("authenticated") is None and not rot.startswith("rejected"):
             status = prev if prev in ("ok", "expired") else "unknown"
             _cookie_state["error"] = probe.get("error")
         else:
@@ -998,7 +1043,16 @@ def api_playlists():
         return jsonify({"error": f"playlists need a cookie (Account): {exc}"}), 400
     try:
         seen = {p.get("playlistId") for p in pls}
-        pls = pls + [p for p in own_playlists(ytm, pls) if p.get("playlistId") not in seen]
+        for extra in own_playlists(ytm, pls):
+            if extra.get("playlistId") in seen:
+                continue
+            # The library is alphabetical after its specials (Liked Music,
+            # episodes, recaps — ids not starting with PL): slot extras in there.
+            key = (extra.get("title") or "").casefold()
+            at = next((i for i, p in enumerate(pls)
+                       if (p.get("playlistId") or "").startswith("PL")
+                       and (p.get("title") or "").casefold() > key), len(pls))
+            pls.insert(at, extra)
     except Exception as exc:  # noqa: BLE001 — the library list alone is still useful
         print(f"[ytm] could not add channel playlists: {exc}", flush=True)
     return jsonify([

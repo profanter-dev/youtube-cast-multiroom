@@ -6,6 +6,12 @@ services:
     image: ghcr.io/profanter-dev/youtube-cast-multiroom-musicbridge:latest
     container_name: musicbridge
     restart: unless-stopped
+    environment:
+      # Local time for the nightly cookie check (COOKIE_REFRESH_AT) and log stamps.
+      - TZ=${TZ:-UTC}
+      - COOKIE_REFRESH_AT=${COOKIE_REFRESH_AT:-04:00}
+      # Optional: alert (e.g. a Home Assistant webhook) when the cookie dies.
+      - NOTIFY_WEBHOOK_URL=${NOTIFY_WEBHOOK_URL:-}
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ${DATA_DIR}/musicbridge:/data

@@ -10,7 +10,7 @@ LABEL org.opencontainers.image.source=https://github.com/profanter-dev/youtube-c
 # --platform linux/amd64. For a real multi-arch build, switch on TARGETARCH here the
 # way snapserver/Dockerfile does.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates curl unzip \
+        ffmpeg ca-certificates tzdata curl unzip \
     && curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
     && unzip /tmp/deno.zip -d /usr/local/bin \
     && chmod +x /usr/local/bin/deno \

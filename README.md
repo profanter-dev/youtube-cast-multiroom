@@ -80,9 +80,15 @@ docker compose pull && docker compose up -d
 
 Open `https://<MUSIC_HOST>` in a browser. **Search** and playback work immediately —
 tap a track and audio starts on every connected Snapcast client (set up the Snapcast
-app on each TV first — see *Install the Snapcast app* below). Adjust per-room volume
-from the **speaker icon** in the now-playing bar ("All rooms" sets every TV to the
-same level). **Library and Playlists** stay empty until you do step 2.
+app on each TV first — see *Install the Snapcast app* below). Tap the mini player to
+open the full player; adjust per-room volume from its **speaker icon** ("All rooms"
+sets every TV to the same level). **Liked and Playlists** stay empty until you do
+step 2.
+
+The UI is built for phones: tabs at the bottom, and the URL always holds the open
+tab, search and playlist, so a reload (or a bookmark) lands in the same spot — scroll
+position included. On Android/iOS use **Add to Home screen** to open it full-screen
+like an app.
 
 ### 2. Connect your YouTube Music account (cookie upload)
 
@@ -99,16 +105,51 @@ cookie:
    shows, your library is visible).
 3. Click the extension → **Export** (current site).
 4. **Close the incognito window without signing out.**
-5. In musicbridge, tap **Account → Choose cookies.txt** and pick that file.
+5. In musicbridge, tap the **account icon** (top right) → **Upload cookies.txt** and
+   pick that file.
 
 The page confirms how many playlists it found. If it says *"signed-out / 0
 playlists"*, the export wasn't from a logged-in YouTube Music session — redo it.
 The cookie is stored at `$DATA_DIR/musicbridge/cookies.txt`, and `browser.json`
 (ytmusicapi browser auth) is generated from it automatically.
 
-> Cookies still go stale eventually — when Library/Playlists empty out, re-export
-> (incognito) and re-upload via **Account → Replace cookie**.
->
+#### Keeping the cookie alive
+
+A browser stays signed in for good; an exported cookie left untouched eventually
+gets signed out (one lasted 7+ weeks here). musicbridge therefore behaves like a
+browser that's opened once a day: **at startup and every night at
+`COOKIE_REFRESH_AT`** (default `04:00`, container-local time — set `TZ`) it
+
+1. asks Google to rotate the short-lived session tokens (`RotateCookies`, what an open
+   YouTube tab does every ~10 min) and writes the new values back into `cookies.txt`,
+2. reads your library once with the cookie — and records whether that worked.
+
+Playback is never affected: yt-dlp streams without the cookie, and the nightly run
+waits while music is playing. Whether this extends the cookie's life isn't publicly
+proven, so musicbridge also **tells you when it dies**: the account icon gets a
+red dot, the Account sheet shows the cookie's age and last good check, and — if you
+set `NOTIFY_WEBHOOK_URL` — it POSTs `{"event": "cookie_expired", "title", "message"}`
+once, e.g. to a Home Assistant automation:
+
+```yaml
+# Home Assistant automation (Settings → Automations → ⋮ → Edit in YAML)
+alias: Multiroom cookie expired
+triggers:
+  - trigger: webhook
+    webhook_id: multiroom-cookie       # → NOTIFY_WEBHOOK_URL=http://<ha-host>:8123/api/webhook/multiroom-cookie
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - action: notify.notify               # or notify.mobile_app_<your_phone>
+    data:
+      title: "{{ trigger.json.title }}"
+      message: "{{ trigger.json.message }}"
+```
+
+Every check is logged (`docker logs musicbridge | grep cookie`) with the cookie's age,
+and kept in `$DATA_DIR/musicbridge/cookie_state.json`. When it does expire, re-export
+(incognito) and use **Account → Replace cookie**.
+
 > Why cookies and not OAuth? YouTube Music has no usable official API for the
 > library, and `ytmusicapi`'s OAuth path is currently broken server-side. The
 > web client (cookie auth) is the only thing that returns your *full* library,
@@ -192,11 +233,14 @@ host — the host never builds anything.
 
 | Variable | Description |
 |---|---|
-| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/cookies.txt` + generated `browser.json`). |
+| `DATA_DIR` | Host path for persistent data (`snapfifo`, `musicbridge/cookies.txt` + generated `browser.json` and `cookie_state.json`). |
 | `MUSIC_HOST` | Hostname Traefik routes to the music web UI. |
 | `SNAPCAST_HOST` | Hostname Traefik routes to the Snapweb UI. |
 | `MUSIC_AUTH` | *Optional* — `htpasswd` `user:hash` (double every `$`). Only used if you add the basic-auth middleware (see Security). |
 | `SNAPSERVER_CONTROL` | *Optional* — Snapcast control `host:port` for the Volume panel (default `snapserver:1705`). |
+| `TZ` | *Optional* — container timezone, e.g. `Europe/Berlin` (default `UTC`). The nightly cookie check uses local time. |
+| `COOKIE_REFRESH_AT` | *Optional* — `HH:MM` of the nightly cookie check + refresh (default `04:00`). |
+| `NOTIFY_WEBHOOK_URL` | *Optional* — URL that gets a JSON POST when the cookie stops working (see *Keeping the cookie alive*). |
 
 musicbridge also reads a few optional yt-dlp tuning vars (rarely needed):
 `YTDLP_FORMAT` (default `bestaudio/best`), `YTDLP_PLAYER_CLIENT` (default empty),
@@ -204,9 +248,11 @@ and `YTDLP_USE_COOKIES` (default `0`).
 
 ## Troubleshooting
 
-- **Library/Playlists empty** — the cookie isn't a logged-in session (or went
-  stale). Re-export from an **incognito** music.youtube.com tab and re-upload via
-  **Account**. The upload reports the playlist count so you know it worked.
+- **Library/Playlists empty / red dot on the account icon** — the cookie isn't a
+  logged-in session (or expired). Re-export from an **incognito** music.youtube.com
+  tab and re-upload via **Account**. The upload reports the playlist count so you
+  know it worked. Don't keep that incognito window open: a browser still using the
+  same session rotates it and signs the server's copy out within minutes.
 - **A track fails with "Requested format is not available"** — handled by default
   (the image bundles the `deno` JS runtime and yt-dlp runs *without* the cookie, so
   YouTube doesn't force SABR-only streams). If you instead see **"confirm you're not

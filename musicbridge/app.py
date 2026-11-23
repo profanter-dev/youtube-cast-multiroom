@@ -12,18 +12,23 @@ ffmpeg, and write that into the same FIFO Snapcast already reads from.
 Control surface: a password-protected web UI (Traefik basic-auth in front).
 """
 
+import http.cookiejar
 import itertools
 import json
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Iterable, Optional
 
+import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
 from ytmusicapi import YTMusic
@@ -60,6 +65,23 @@ YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "")
 # 1 only if extraction starts failing with "confirm you're not a bot".
 YTDLP_USE_COOKIES = os.environ.get("YTDLP_USE_COOKIES", "0") == "1"
 
+# Cookie keeper (see the "Cookie keeper" section below).
+# When the nightly check + refresh runs, in the container's local time (set TZ).
+COOKIE_REFRESH_AT = os.environ.get("COOKIE_REFRESH_AT", "04:00")
+# The endpoint a signed-in YouTube page calls every ~10 min to rotate the
+# short-lived __Secure-*PSIDTS session tokens. Undocumented; overridable for tests.
+COOKIE_ROTATE_URL = os.environ.get("COOKIE_ROTATE_URL",
+                                   "https://accounts.youtube.com/RotateCookies")
+# Google answers a second rotation within ~10 min with 429, so never rotate more
+# often than this — protects against restart loops.
+COOKIE_ROTATE_MIN_INTERVAL = int(os.environ.get("COOKIE_ROTATE_MIN_INTERVAL", "900"))
+# Optional: POSTed as JSON when the cookie stops working (e.g. a Home Assistant
+# webhook trigger URL — see README).
+NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "")
+COOKIE_STATE_FILE = os.environ.get(
+    "COOKIE_STATE_FILE",
+    os.path.join(os.path.dirname(COOKIES_FILE) or ".", "cookie_state.json"))
+
 # Snapcast stream format — MUST match snapserver.conf (sampleformat=48000:16:2).
 SAMPLE_RATE = "48000"
 CHANNELS = "2"
@@ -70,6 +92,17 @@ CHANNELS = "2"
 
 _ytmusic: Optional[YTMusic] = None
 _ytmusic_lock = threading.Lock()
+
+
+def write_atomic(path: str, text: str):
+    """Write via a temp file + rename, so a reader (ytmusicapi, yt-dlp, a crash
+    mid-write) never sees a half-written cookie or browser.json."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def parse_cookies_txt(path: str) -> dict:
@@ -117,8 +150,7 @@ def build_browser_json() -> bool:
         "origin": YTM_ORIGIN,
         "cookie": cookie_str,
     }
-    with open(AUTH_FILE, "w") as f:
-        json.dump(headers, f)
+    write_atomic(AUTH_FILE, json.dumps(headers))
     print(f"[ytm] built {AUTH_FILE} from cookies.txt "
           f"({len(cookies)} cookies)", flush=True)
     return True
@@ -153,22 +185,335 @@ def reset_ytmusic():
         _ytmusic = None
 
 
+def _transient(exc: Exception) -> bool:
+    """Network trouble / rate limit / YouTube hiccup — says nothing about the cookie."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    msg = str(exc)
+    return "HTTP 429" in msg or "HTTP 5" in msg
+
+
 def account_probe() -> dict:
-    """Check whether the current cookie is a logged-in session and report counts."""
+    """One signed-in read of the library: tells whether the cookie is a logged-in
+    session, and is also the daily 'activity' the cookie keeper generates.
+
+    authenticated: True (signed in) | False (signed out / expired) |
+                   None (couldn't tell — network error, rate limit).
+    """
     try:
         ytm = get_ytmusic()
-        playlists = ytm.get_library_playlists(limit=50)
-        # get_liked_songs throws a specific error when the session is signed out;
-        # if it returns, we're definitely authenticated.
         try:
-            liked = ytm.get_liked_songs(limit=1)
+            playlists = ytm.get_library_playlists(limit=50)
+        except Exception as exc:  # noqa: BLE001
+            if _transient(exc):
+                raise
+            playlists = []
+        # get_liked_songs throws when the session is signed out; if it returns,
+        # we're definitely authenticated.
+        try:
+            ytm.get_liked_songs(limit=1)
             liked_ok = True
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _transient(exc):
+                raise
             liked_ok = False
         authenticated = len(playlists) > 0 or liked_ok
         return {"authenticated": authenticated, "playlists": len(playlists)}
     except Exception as exc:  # noqa: BLE001
-        return {"authenticated": False, "error": str(exc)[:200]}
+        return {"authenticated": None if _transient(exc) else False,
+                "error": str(exc)[:200]}
+
+
+# --------------------------------------------------------------------------- #
+# Cookie keeper
+#
+# A browser stays signed in to YouTube indefinitely; an exported cookie sitting
+# untouched on a server eventually doesn't (ours died after 7+ weeks). What a
+# browser does that we didn't: use the session regularly, and keep the
+# short-lived __Secure-*PSIDTS tokens rotated (RotateCookies), storing what
+# Google sends back. So once at startup and once a night we do the same:
+# rotate, persist the new values, then one signed-in library read. Whether
+# that extends the session's lifetime isn't publicly proven — hence the state
+# file + log lines (to measure it) and the webhook alert (so an expiry is
+# noticed the morning it happens, not when you want music).
+#
+# Playback never touches any of this: yt-dlp streams without the cookie by
+# default, and the nightly run waits while something is playing anyway.
+# --------------------------------------------------------------------------- #
+
+_cookie_lock = threading.RLock()     # serialises every cookies.txt read-modify-write
+
+
+def _now() -> datetime:
+    return datetime.now().astimezone().replace(microsecond=0)
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_state() -> dict:
+    try:
+        with open(COOKIE_STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    if os.path.exists(COOKIES_FILE) and not state.get("uploaded_at"):
+        # Cookie predates the keeper: its mtime is the upload time (we never
+        # rewrote it before), so the age stays measurable.
+        mtime = datetime.fromtimestamp(os.path.getmtime(COOKIES_FILE)).astimezone()
+        state["uploaded_at"] = mtime.replace(microsecond=0).isoformat()
+        state.setdefault("status", "unknown")
+    return state
+
+
+_cookie_state: dict = _load_state()
+
+
+def _save_state():
+    try:
+        write_atomic(COOKIE_STATE_FILE, json.dumps(_cookie_state, indent=2))
+    except OSError as exc:
+        print(f"[cookie] cannot save {COOKIE_STATE_FILE}: {exc}", flush=True)
+
+
+def _cookie_age(at: Optional[datetime] = None) -> str:
+    up = _parse_ts(_cookie_state.get("uploaded_at"))
+    if not up:
+        return "unknown age"
+    secs = ((at or _now()) - up).total_seconds()
+    return f"{secs / 86400:.1f} days old"
+
+
+def merge_cookies(cookies: Iterable[http.cookiejar.Cookie]) -> int:
+    """Write updated cookie values into cookies.txt; returns how many changed.
+
+    Matches lines on (domain without leading dot, name) and keeps everything
+    else — order, #HttpOnly_ prefixes, cookies we got no update for — as is.
+    Only cookies sent to music.youtube.com are taken (a host-only cookie for
+    accounts.youtube.com must not shadow a same-named .youtube.com one).
+    """
+    updates = {}
+    for c in cookies:
+        dom = (c.domain or "").lstrip(".")
+        if dom in ("youtube.com", "music.youtube.com") and c.value is not None:
+            updates[(dom, c.name)] = c
+    if not updates:
+        return 0
+    with _cookie_lock:
+        with open(COOKIES_FILE) as f:
+            lines = f.read().splitlines()
+        seen, changed = set(), 0
+        for i, line in enumerate(lines):
+            prefix = ""
+            if line.startswith("#HttpOnly_"):
+                prefix, line = "#HttpOnly_", line[len("#HttpOnly_"):]
+            elif not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            key = (parts[0].lstrip("."), parts[5])
+            c = updates.get(key)
+            if c is None:
+                continue
+            seen.add(key)
+            new_exp = str(int(c.expires)) if c.expires else parts[4]
+            if parts[6] == c.value and parts[4] == new_exp:
+                continue
+            parts[6], parts[4] = c.value, new_exp
+            lines[i] = prefix + "\t".join(parts)
+            changed += 1
+        for key, c in updates.items():
+            if key in seen:
+                continue
+            httponly = c.has_nonstandard_attr("HttpOnly") or c.has_nonstandard_attr("httponly")
+            lines.append(("#HttpOnly_" if httponly else "") + "\t".join([
+                c.domain, "TRUE" if c.domain.startswith(".") else "FALSE",
+                c.path or "/", "TRUE" if c.secure else "FALSE",
+                str(int(c.expires or 0)), c.name, c.value]))
+            changed += 1
+        if changed:
+            write_atomic(COOKIES_FILE, "\n".join(lines) + "\n")
+        return changed
+
+
+def _set_cookies(resp: requests.Response) -> list:
+    """The response's Set-Cookie headers as Cookie objects. Parsed by hand: the
+    stdlib jar silently drops cookies its domain policy dislikes, and
+    SimpleCookie truncates values containing '/' (SAPISID has them)."""
+    host = requests.utils.urlparse(resp.url).hostname or ""
+    out = []
+    for header in resp.raw.headers.getlist("Set-Cookie"):
+        first, *attrs = header.split(";")
+        name, eq, value = first.strip().partition("=")
+        if not eq or not name:
+            continue
+        a = {}
+        for attr in attrs:
+            k, _, v = attr.strip().partition("=")
+            a[k.lower()] = v.strip()
+        expires = None
+        if a.get("max-age", "").lstrip("-").isdigit():
+            expires = int(time.time()) + int(a["max-age"])
+        elif a.get("expires"):
+            expires = http.cookiejar.http2time(a["expires"])
+        if expires is not None and expires <= time.time():
+            continue                  # a deletion — keep what we have
+        domain = a.get("domain", "")
+        domain = ("." + domain.lstrip(".")) if domain else host
+        out.append(http.cookiejar.Cookie(
+            0, name, value.strip(), None, False, domain, bool(a.get("domain")),
+            domain.startswith("."), a.get("path") or "/", "path" in a,
+            "secure" in a, expires, False, None, None,
+            {"HttpOnly": ""} if "httponly" in a else {}))
+    return out
+
+
+def rotate_cookies() -> str:
+    """Ask Google for fresh __Secure-*PSIDTS tokens, like an open YouTube tab does
+    every ~10 min, and store them. Returns 'ok …' | 'expired …' | 'error: …'."""
+    cookie_str = "; ".join(f"{k}={v}" for k, v in parse_cookies_txt(COOKIES_FILE).items())
+    try:
+        resp = requests.post(
+            COOKIE_ROTATE_URL,
+            data='[000,"-0000000000000000000"]',
+            headers={"Content-Type": "application/json",
+                     "Origin": "https://accounts.youtube.com",
+                     "Cookie": cookie_str},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return f"error: {exc.__class__.__name__}: {exc}"[:200]
+    if resp.status_code in (401, 403):     # 403 is what a dead session gets today
+        return f"expired (HTTP {resp.status_code})"
+    if not resp.ok:
+        return f"error: HTTP {resp.status_code}"
+    changed = merge_cookies(_set_cookies(resp))
+    _cookie_state["rotated_at"] = _now().isoformat()
+    _cookie_state["rotations"] = _cookie_state.get("rotations", 0) + 1
+    if changed:
+        build_browser_json()
+        reset_ytmusic()
+    return f"ok ({changed} cookie(s) updated)"
+
+
+def notify(event: str, message: str):
+    if not NOTIFY_WEBHOOK_URL:
+        return
+    try:
+        requests.post(NOTIFY_WEBHOOK_URL, timeout=15, json={
+            "event": event, "title": "Multiroom", "message": message})
+        print(f"[cookie] notified webhook: {event}", flush=True)
+    except requests.RequestException as exc:
+        print(f"[cookie] webhook failed: {exc}", flush=True)
+
+
+def maintain_cookie(reason: str, rotate: bool = True) -> dict:
+    """Rotate (if due) + one signed-in read; record and log the outcome, and
+    alert once when the cookie turns out to be dead."""
+    with _cookie_lock:
+        if not os.path.exists(COOKIES_FILE):
+            _cookie_state.clear()
+            _cookie_state["status"] = "none"
+            _save_state()
+            return dict(_cookie_state)
+
+        if not os.path.exists(AUTH_FILE):
+            build_browser_json()
+        rot = "skipped"
+        if rotate:
+            last = _parse_ts(_cookie_state.get("rotated_at"))
+            if last and (_now() - last).total_seconds() < COOKIE_ROTATE_MIN_INTERVAL:
+                rot = "skipped (rotated recently)"
+            else:
+                rot = rotate_cookies()
+
+        probe = account_probe()
+        now = _now()
+        prev = _cookie_state.get("status")
+        _cookie_state["checked_at"] = now.isoformat()
+        if probe.get("authenticated"):
+            status = "ok"
+            _cookie_state["ok_at"] = now.isoformat()
+            _cookie_state["playlists"] = probe.get("playlists", 0)
+            _cookie_state.pop("expired_at", None)
+            _cookie_state.pop("error", None)
+        elif probe.get("authenticated") is None and not rot.startswith("expired"):
+            status = prev if prev in ("ok", "expired") else "unknown"
+            _cookie_state["error"] = probe.get("error")
+        else:
+            status = "expired"
+            _cookie_state.setdefault("expired_at", now.isoformat())
+            _cookie_state["error"] = probe.get("error") or "signed out"
+        _cookie_state["status"] = status
+        _save_state()
+
+        print(f"[cookie] {reason}: rotate={rot}; session={status.upper()}"
+              f"{' (' + str(probe.get('playlists')) + ' playlists)' if status == 'ok' else ''}"
+              f"; cookie {_cookie_age(now)}"
+              f"{'; ' + str(_cookie_state.get('error')) if status != 'ok' else ''}",
+              flush=True)
+        # Alert on the transition only — and not for a dead cookie just uploaded
+        # (the Account sheet already says so).
+        if status == "expired" and prev != "expired" and reason != "upload":
+            ok_at = _parse_ts(_cookie_state.get("ok_at"))
+            notify("cookie_expired",
+                   "YouTube Music cookie stopped working "
+                   f"({_cookie_age(now)}; last OK {ok_at:%d %b %H:%M})." if ok_at else
+                   f"YouTube Music cookie stopped working ({_cookie_age(now)}).")
+            print(f"[cookie] ⚠ EXPIRED — {_cookie_age(now)}, last OK "
+                  f"{_cookie_state.get('ok_at') or 'never'}; upload a fresh one "
+                  "via Account", flush=True)
+        return dict(_cookie_state)
+
+
+def next_refresh_at(after: Optional[datetime] = None) -> datetime:
+    after = after or _now()
+    try:
+        hh, mm = (int(x) for x in COOKIE_REFRESH_AT.split(":", 1))
+    except ValueError:
+        hh, mm = 4, 0
+    target = after.replace(hour=hh, minute=mm, second=0)
+    if target <= after:
+        target += timedelta(days=1)
+    return target
+
+
+def cookie_status() -> dict:
+    """Cookie health for the UI."""
+    s = dict(_cookie_state)
+    s.setdefault("status", "none" if not os.path.exists(COOKIES_FILE) else "unknown")
+    if os.path.exists(COOKIES_FILE):
+        s["next_check_at"] = next_refresh_at().isoformat()
+    return s
+
+
+def _cookie_keeper():
+    time.sleep(3)                    # let the web server come up first
+    try:
+        maintain_cookie("startup")
+    except Exception as exc:  # noqa: BLE001 — never let the keeper die
+        print(f"[cookie] startup check failed: {exc}", flush=True)
+    while True:
+        target = next_refresh_at()
+        # Sleep in short slices: robust against suspend/clock jumps.
+        while _now() < target:
+            time.sleep(min(60, max(1, (target - _now()).total_seconds())))
+        # Nobody listens at night — but if something *is* playing, wait for it
+        # to stop (up to 3 h; the check is harmless to playback regardless).
+        deadline = target + timedelta(hours=3)
+        if engine.current is not None:
+            print("[cookie] nightly check: music is playing — waiting", flush=True)
+        while engine.current is not None and _now() < deadline:
+            time.sleep(60)
+        try:
+            maintain_cookie("nightly")
+        except Exception as exc:  # noqa: BLE001 — never let the keeper die
+            print(f"[cookie] nightly check failed: {exc}", flush=True)
 
 
 def normalize_track(item: dict) -> Optional[dict]:
@@ -404,8 +749,15 @@ class Engine:
         if YTDLP_PLAYER_CLIENT:
             ytdlp_cmd += ["--extractor-args",
                           f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
+        # yt-dlp rewrites its --cookies file on exit. Give it a private copy (so it
+        # can't race the cookie keeper or an upload) and merge back what it got.
+        jar_copy = None
         if YTDLP_USE_COOKIES and os.path.exists(COOKIES_FILE):
-            ytdlp_cmd += ["--cookies", COOKIES_FILE]
+            fd, jar_copy = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
+            os.close(fd)
+            with _cookie_lock:
+                shutil.copyfile(COOKIES_FILE, jar_copy)
+            ytdlp_cmd += ["--cookies", jar_copy]
         ytdlp_cmd.append(url)
 
         started = time.monotonic()
@@ -450,6 +802,8 @@ class Engine:
                     except ProcessLookupError:
                         pass
             self._ytdlp = self._ffmpeg = None
+            if jar_copy:
+                _merge_back_ytdlp_jar(jar_copy)
 
     def _watch_progress(self, proc):
         """Clear `loading` once ffmpeg reports it's actually producing audio,
@@ -470,6 +824,22 @@ class Engine:
                 except Exception:  # noqa: BLE001
                     pass
         except Exception:  # noqa: BLE001
+            pass
+
+
+def _merge_back_ytdlp_jar(path: str):
+    try:
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+        if os.path.exists(COOKIES_FILE) and merge_cookies(jar):
+            build_browser_json()
+            reset_ytmusic()
+    except Exception as exc:  # noqa: BLE001 — best effort
+        print(f"[ytdlp] could not merge back yt-dlp cookies: {exc}", flush=True)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
             pass
 
 
@@ -496,7 +866,14 @@ def index():
 
 @app.get("/favicon.ico")
 def favicon():
-    return Response(status=204)
+    return send_from_directory("static", "icon.svg", mimetype="image/svg+xml")
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    # "Add to Home screen" opens it full-screen, like an app.
+    return send_from_directory("static", "manifest.webmanifest",
+                               mimetype="application/manifest+json")
 
 
 # --- Account (cookie upload) ----------------------------------------------- #
@@ -504,7 +881,14 @@ def favicon():
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    return jsonify({"method": auth_method()})
+    return jsonify({"method": auth_method(), "cookie": cookie_status()})
+
+
+@app.post("/api/auth/check")
+def api_auth_check():
+    """'Check now' in the Account sheet: a signed-in read, no rotation."""
+    maintain_cookie("manual check", rotate=False)
+    return jsonify({"method": auth_method(), "cookie": cookie_status()})
 
 
 @app.post("/api/cookies")
@@ -516,27 +900,32 @@ def api_cookies():
         return jsonify({"ok": False,
                         "error": "That doesn't look like a cookies.txt "
                         "(expected Netscape/tab-separated YouTube cookies)."}), 400
-    with open(COOKIES_FILE, "w") as f:
-        f.write(raw)
-    if not build_browser_json():
-        return jsonify({"ok": False,
-                        "error": "Saved, but the cookie is missing the values "
-                        "needed for login (SAPISID). Re-export while logged in "
-                        "to music.youtube.com."}), 400
-    reset_ytmusic()
-    probe = account_probe()
-    print(f"[ytm] cookie uploaded — authenticated={probe.get('authenticated')} "
-          f"playlists={probe.get('playlists')}", flush=True)
-    return jsonify({"ok": True, **probe})
+    with _cookie_lock:
+        write_atomic(COOKIES_FILE, raw)
+        if not build_browser_json():
+            return jsonify({"ok": False,
+                            "error": "Saved, but the cookie is missing the values "
+                            "needed for login (SAPISID). Re-export while logged in "
+                            "to music.youtube.com."}), 400
+        reset_ytmusic()
+        _cookie_state.clear()
+        _cookie_state["uploaded_at"] = _now().isoformat()
+        print("[cookie] new cookie uploaded", flush=True)
+        state = maintain_cookie("upload", rotate=False)
+    return jsonify({"ok": True, "authenticated": state.get("status") == "ok",
+                    "playlists": state.get("playlists", 0),
+                    "cookie": cookie_status()})
 
 
 @app.post("/api/auth/logout")
 def api_auth_logout():
-    for path in (AUTH_FILE, COOKIES_FILE):
-        if os.path.exists(path):
-            os.remove(path)
-    reset_ytmusic()
-    return jsonify({"method": auth_method()})
+    with _cookie_lock:
+        for path in (AUTH_FILE, COOKIES_FILE, COOKIE_STATE_FILE):
+            if os.path.exists(path):
+                os.remove(path)
+        _cookie_state.clear()
+        reset_ytmusic()
+    return jsonify({"method": auth_method(), "cookie": cookie_status()})
 
 
 @app.get("/api/search")
@@ -746,5 +1135,10 @@ if __name__ == "__main__":
     else:
         print(f"[ytdlp] no cookie at {COOKIES_FILE} — upload one via the Account "
               "button for library/playlists")
+    print(f"[cookie] keeper: check + refresh at startup and daily at "
+          f"{COOKIE_REFRESH_AT} ({time.strftime('%Z')}); alerts "
+          f"{'→ webhook' if NOTIFY_WEBHOOK_URL else 'off (NOTIFY_WEBHOOK_URL unset)'}",
+          flush=True)
+    threading.Thread(target=_cookie_keeper, daemon=True).start()
     print(f"[musicbridge] serving on :{PORT}, FIFO={SNAPFIFO}")
     serve(app, host="0.0.0.0", port=PORT, threads=8)

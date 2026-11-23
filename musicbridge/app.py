@@ -180,9 +180,44 @@ def get_ytmusic() -> YTMusic:
 
 def reset_ytmusic():
     """Drop the cached client so the next call rebuilds with current auth."""
-    global _ytmusic
+    global _ytmusic, _own_channel
     with _ytmusic_lock:
         _ytmusic = None
+        _own_channel = None             # a new cookie may be a different account
+
+
+# The account's own YouTube channel id, found lazily (see own_playlists()).
+_own_channel: Optional[str] = None
+
+
+def own_playlists(ytm: YTMusic, library: list) -> list:
+    """The account's own public playlists that YouTube Music's library list leaves
+    out. YTM's library doesn't include every playlist you own (e.g. some created on
+    youtube.com), but your channel page lists them all — so merge those in.
+
+    The channel id comes from any owned playlist in the library (get_playlist
+    marks owned ones and names their author)."""
+    global _own_channel
+    if _own_channel is None:
+        for p in library:
+            pid = p.get("playlistId") or ""
+            if not pid.startswith("PL"):        # skip Liked Music, episodes, recaps
+                continue
+            try:
+                d = ytm.get_playlist(pid, limit=1)
+            except Exception:  # noqa: BLE001
+                continue
+            author = d.get("author") or {}
+            if d.get("owned") and author.get("id"):
+                _own_channel = author["id"]
+                break
+        else:
+            return []
+    user = ytm.get_user(_own_channel)
+    section = user.get("playlists") or {}
+    if section.get("params"):
+        return ytm.get_user_playlists(_own_channel, section["params"])
+    return section.get("results") or []
 
 
 def _transient(exc: Exception) -> bool:
@@ -956,10 +991,16 @@ def api_library():
 
 @app.get("/api/playlists")
 def api_playlists():
+    ytm = get_ytmusic()
     try:
-        pls = get_ytmusic().get_library_playlists(limit=100)
+        pls = ytm.get_library_playlists(limit=100)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"playlists need a cookie (Account): {exc}"}), 400
+    try:
+        seen = {p.get("playlistId") for p in pls}
+        pls = pls + [p for p in own_playlists(ytm, pls) if p.get("playlistId") not in seen]
+    except Exception as exc:  # noqa: BLE001 — the library list alone is still useful
+        print(f"[ytm] could not add channel playlists: {exc}", flush=True)
     return jsonify([
         {
             "playlistId": p.get("playlistId"),

@@ -643,7 +643,7 @@ class Engine:
     _stop: bool = False
     _skipped: bool = False
     _natural_end: bool = False                       # last track finished on its own
-    _started: float = 0.0                            # monotonic start of current track
+    _started: float = 0.0                            # monotonic time audio started (0: not yet)
     _paused_at: float = 0.0                          # monotonic time pause began
     _paused_accum: float = 0.0                       # total paused seconds this track
     _got_audio: bool = False                         # this attempt produced audio
@@ -651,8 +651,13 @@ class Engine:
     def __post_init__(self):
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
+        self._prefetched: dict = {}               # videoId -> downloaded file
+        self._pf_lock = threading.Lock()
+        self._pf_event = threading.Event()
+        self._pf_dir = tempfile.mkdtemp(prefix="musicbridge-prefetch-")
         ensure_fifo()
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._prefetch_loop, daemon=True).start()
 
     # -- public controls ---------------------------------------------------- #
 
@@ -821,7 +826,7 @@ class Engine:
                 self._stop = False
                 self._skipped = False
                 self._natural_end = False
-                self._started = time.monotonic()
+                self._started = 0.0          # the clock starts with the audio
                 self._paused_at = 0.0
                 self._paused_accum = 0.0
                 self.loading = True          # cleared once ffmpeg emits audio
@@ -833,41 +838,39 @@ class Engine:
                 # Did the track finish on its own (vs. skip/prev/stop)?
                 self._natural_end = not (self._skipped or self._stop)
 
-    def _play_blocking(self, track: dict):
-        got_audio = self._attempt(track, with_cookies=YTDLP_USE_COOKIES)
-        # Your own uploads (and other private/age-gated videos) only open with
-        # your login; the cookie-free path can't fetch them. Retry those once with
-        # the cookie — but only then, since a logged-in session pushes normal
-        # songs onto streams yt-dlp can't download.
-        if (not got_audio and not self._skipped and not self._stop
-                and os.path.exists(COOKIES_FILE)):
-            print("[player] ↻ no audio — retrying as YouTube Music, logged in "
-                  "(needed for your uploads)", flush=True)
-            self.loading = True
-            self._attempt(track, with_cookies=True, music_client=True)
+    # -- getting a track's audio ------------------------------------------ #
 
-    def _attempt(self, track: dict, with_cookies: bool,
-                 music_client: bool = False) -> bool:
-        """One yt-dlp -> ffmpeg -> FIFO run. Returns whether audio came out.
+    @staticmethod
+    def _ways() -> list:
+        """(with_cookies, music_client) for each way to get a track, in order:
+        cookie-free first; then — for your uploads (and other private videos),
+        which only YouTube Music's own client may stream, logged in — as YouTube
+        Music with the cookie. Not the other way round: a logged-in session
+        pushes normal songs onto streams yt-dlp can't download."""
+        ways = [(YTDLP_USE_COOKIES, False)]
+        if os.path.exists(COOKIES_FILE):
+            ways.append((True, True))
+        return ways
+
+    @staticmethod
+    def _ytdlp_cmd(video_id: str, out: str, with_cookies: bool, music_client: bool):
+        """yt-dlp command for one try, plus its private cookie-jar copy (or None).
 
         music_client: ask as YouTube Music (music.youtube.com + web_music client,
         PO token from POT_PROVIDER_URL) — the only way to get your uploads."""
-        self._got_audio = False
-        video_id = track["videoId"]
-        ytdlp_cmd = ["yt-dlp", "-f", YTDLP_FORMAT, "-o", "-",
-                     "--quiet", "--no-warnings", "--no-progress"]
+        cmd = ["yt-dlp", "-f", YTDLP_FORMAT, "-o", out,
+               "--quiet", "--no-warnings", "--no-progress"]
         if music_client:
             url = f"https://music.youtube.com/watch?v={video_id}"
-            ytdlp_cmd += ["--extractor-args", "youtube:player_client=web_music"]
+            cmd += ["--extractor-args", "youtube:player_client=web_music"]
             if POT_PROVIDER_URL:
-                ytdlp_cmd += ["--extractor-args",
-                              f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
+                cmd += ["--extractor-args",
+                        f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
         else:
             # www.youtube.com extracts more reliably than music.youtube.com here.
             url = f"https://www.youtube.com/watch?v={video_id}"
             if YTDLP_PLAYER_CLIENT:
-                ytdlp_cmd += ["--extractor-args",
-                              f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
+                cmd += ["--extractor-args", f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
         # yt-dlp rewrites its --cookies file on exit. Give it a private copy (so it
         # can't race the cookie keeper or an upload) and merge back what it got.
         jar_copy = None
@@ -876,37 +879,75 @@ class Engine:
             os.close(fd)
             with _cookie_lock:
                 shutil.copyfile(COOKIES_FILE, jar_copy)
-            ytdlp_cmd += ["--cookies", jar_copy]
-        ytdlp_cmd.append(url)
+            cmd += ["--cookies", jar_copy]
+        cmd.append(url)
+        return cmd, jar_copy
+
+    def _play_blocking(self, track: dict):
+        video_id = track["videoId"]
+        with self._pf_lock:
+            prefetched = self._prefetched.pop(video_id, None)
+        if prefetched:
+            ok = self._attempt(track, source=prefetched)
+            try:
+                os.remove(prefetched)
+            except OSError:
+                pass
+            if ok or self._skipped or self._stop:
+                return
+            print("[player] ↻ prefetched file didn't play — streaming instead", flush=True)
+            self.loading = True
+        for i, (with_cookies, music_client) in enumerate(self._ways()):
+            if i:
+                if self._skipped or self._stop:
+                    return
+                print("[player] ↻ no audio — retrying as YouTube Music, logged in "
+                      "(needed for your uploads)", flush=True)
+                self.loading = True
+            if self._attempt(track, with_cookies=with_cookies, music_client=music_client):
+                return
+
+    def _attempt(self, track: dict, with_cookies: bool = False,
+                 music_client: bool = False, source: Optional[str] = None) -> bool:
+        """One run into the FIFO: yt-dlp -> ffmpeg, or ffmpeg straight from a
+        prefetched file (source). Returns whether audio came out."""
+        self._got_audio = False
+        video_id = track["videoId"]
+        ytdlp_cmd, jar_copy = (None, None) if source else \
+            self._ytdlp_cmd(video_id, "-", with_cookies, music_client)
 
         started = time.monotonic()
         print(f"[player] ▶ {track.get('title', video_id)} ({video_id})"
+              f"{' [prefetched]' if source else ''}"
               f"{' [with cookie]' if jar_copy else ''}"
               f"{' [YouTube Music client]' if music_client else ''}", flush=True)
         try:
             # stderr is inherited (not silenced) so yt-dlp/ffmpeg errors land in
             # `docker compose logs musicbridge`.
-            self._ytdlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE)
+            if ytdlp_cmd:
+                self._ytdlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE)
             self._ffmpeg = subprocess.Popen(
                 # -y: don't refuse to "overwrite" the FIFO, which always exists.
                 # -progress pipe:1: machine-readable progress on stdout, which we
                 # watch to know when audio actually starts flowing.
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                 "-i", "pipe:0", "-f", "s16le",
+                 "-i", source or "pipe:0", "-f", "s16le",
                  "-ar", SAMPLE_RATE, "-ac", CHANNELS,
                  "-progress", "pipe:1", SNAPFIFO],
-                stdin=self._ytdlp.stdout, stdout=subprocess.PIPE,
+                stdin=self._ytdlp.stdout if self._ytdlp else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
             )
-            # Let ffmpeg own the read end so yt-dlp gets SIGPIPE if ffmpeg dies.
-            self._ytdlp.stdout.close()
+            if self._ytdlp:
+                # Let ffmpeg own the read end so yt-dlp gets SIGPIPE if ffmpeg dies.
+                self._ytdlp.stdout.close()
             threading.Thread(target=self._watch_progress,
                              args=(self._ffmpeg,), daemon=True).start()
             ff_rc = self._ffmpeg.wait()
-            yt_rc = self._ytdlp.wait()
+            yt_rc = self._ytdlp.wait() if self._ytdlp else "-"
             elapsed = time.monotonic() - started
             print(f"[player] ■ ended after {elapsed:.1f}s "
                   f"(ffmpeg={ff_rc}, yt-dlp={yt_rc})", flush=True)
-            if not self._got_audio and not self._skipped:
+            if not self._got_audio and not self._skipped and not source:
                 if jar_copy:
                     print("[player] ⚠ no audio even with the cookie — yt-dlp could "
                           "not get the stream (see its error above).", flush=True)
@@ -930,6 +971,72 @@ class Engine:
                 _merge_back_ytdlp_jar(jar_copy)
         return self._got_audio
 
+    # -- prefetch ----------------------------------------------------------- #
+    # Looking a track up with yt-dlp takes ~7-9 s. While a song plays, download
+    # the next queued one to a temp file, so it starts right away when its turn
+    # comes. Anything off (not ready, queue changed, bad file) falls back to
+    # streaming as usual.
+
+    def _upcoming(self) -> Optional[dict]:
+        """The track that will play after the current one, if known. Caller holds lock."""
+        if self.repeat == "one" or not self.queue:
+            return None
+        return self.queue[0]
+
+    def _prefetch_loop(self):
+        while True:
+            self._pf_event.wait(3)
+            self._pf_event.clear()
+            with self._lock:
+                if self.loading:            # a track is starting: don't compete,
+                    continue                # and don't delete what it's about to use
+                nxt = self._upcoming() if self.current else None
+            want = (nxt or {}).get("videoId")
+            with self._pf_lock:
+                for vid in [v for v in self._prefetched if v != want]:
+                    try:
+                        os.remove(self._prefetched.pop(vid))
+                    except OSError:
+                        pass
+                if not want or want in self._prefetched:
+                    continue
+            path = self._download(nxt)
+            if path:
+                with self._pf_lock:
+                    self._prefetched[want] = path
+
+    def _download(self, track: dict) -> Optional[str]:
+        vid = track["videoId"]
+        started = time.monotonic()
+        for with_cookies, music_client in self._ways():
+            out = os.path.join(self._pf_dir, f"{vid}.%(ext)s")
+            cmd, jar_copy = self._ytdlp_cmd(vid, out, with_cookies, music_client)
+            try:
+                rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=180).returncode
+            except subprocess.TimeoutExpired:
+                rc = -1
+            finally:
+                if jar_copy:
+                    _merge_back_ytdlp_jar(jar_copy)
+            done = [f for f in os.listdir(self._pf_dir)
+                    if f.startswith(vid + ".") and not f.endswith((".part", ".ytdl"))]
+            if rc == 0 and done:
+                path = os.path.join(self._pf_dir, done[0])
+                print(f"[prefetch] ✓ next up: {track.get('title', vid)} "
+                      f"({os.path.getsize(path) / 1e6:.1f} MB in "
+                      f"{time.monotonic() - started:.1f}s)", flush=True)
+                return path
+            for f in os.listdir(self._pf_dir):          # partial leftovers
+                if f.startswith(vid + "."):
+                    try:
+                        os.remove(os.path.join(self._pf_dir, f))
+                    except OSError:
+                        pass
+        print(f"[prefetch] ✗ couldn't prefetch {track.get('title', vid)} "
+              "— it will stream when its turn comes", flush=True)
+        return None
+
     def _watch_progress(self, proc):
         """Clear `loading` once ffmpeg reports it's actually producing audio,
         then keep draining its progress output so it never blocks on a full pipe."""
@@ -944,8 +1051,14 @@ class Engine:
                     if raw.startswith((b"out_time_us=", b"out_time_ms=")):
                         val = raw.split(b"=", 1)[1].strip()
                         if val.isdigit() and int(val.decode()) > 0:
-                            self.loading = False
+                            with self._lock:
+                                # Start the track clock now, not at the tap:
+                                # yt-dlp needs several seconds to deliver audio.
+                                self._started = time.monotonic()
+                                self._paused_accum = 0.0
+                                self.loading = False
                             self._got_audio = True
+                            self._pf_event.set()     # now fetch the next one
                             cleared = True
                 except Exception:  # noqa: BLE001
                     pass

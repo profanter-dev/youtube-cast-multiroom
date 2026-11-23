@@ -760,6 +760,7 @@ $("#shuffle").onclick = () => action("shuffle", { on: !shuffle });
 $("#repeat").onclick = () => action("repeat", { mode: { off: "all", all: "one", one: "off" }[repeat] || "off" });
 
 function displayedElapsed() {
+  if (loadingTrack) return 0;          // the clock starts with the audio, not the tap
   let cur = paused ? anchorElapsed : anchorElapsed + (performance.now() - anchorTime) / 1000;
   if (npDur) cur = Math.min(cur, npDur);
   return Math.max(0, cur);
@@ -774,6 +775,7 @@ function renderProgress() {
 }
 setInterval(renderProgress, 250);
 
+let wasLoading = false;
 function syncProgress(s) {
   const trackChanged = s.current.videoId !== npVid;
   npDur = s.current.duration || 0;
@@ -781,7 +783,9 @@ function syncProgress(s) {
   paused = s.paused;
   const predicted = displayedElapsed();
   const serverEl = s.elapsed || 0;
-  if (trackChanged || paused !== wasPaused || !anchorTime || Math.abs(serverEl - predicted) > 1) {
+  const loadChanged = !!s.loading !== wasLoading;
+  wasLoading = !!s.loading;
+  if (trackChanged || loadChanged || paused !== wasPaused || !anchorTime || Math.abs(serverEl - predicted) > 1) {
     anchorElapsed = serverEl; anchorTime = performance.now();
   }
 }
@@ -817,18 +821,23 @@ function applyStatus(s) {
   const qn = (s.queue || []).length, badge = $("#qbadge");
   badge.textContent = qn > 99 ? "99+" : qn; badge.classList.toggle("show", qn > 0);
 
+  // Just tapped a song: until the server has switched to it, keep showing it
+  // (as loading) instead of flashing the previous track.
+  if (pending && performance.now() < pendingUntil
+      && !(s.current && s.current.videoId === pending.videoId)) {
+    loadingTrack = true;
+    updatePlayButton();
+    markPlaying();
+    return;
+  }
+  pending = null;
+
   const wasPlaying = playing;
   playing = !!s.current;
   document.body.classList.toggle("has-mini", playing);
   if (s.current) {
     const c = s.current;
-    if (c.videoId !== npVid) {
-      $("#mini-img").src = big(c.thumb, 120);
-      $("#p-img").src = big(c.thumb);
-      $("#p-bg").style.backgroundImage = c.thumb ? `url('${big(c.thumb, 120).replace(/'/g, "%27")}')` : "none";
-    }
-    $("#mini-title").textContent = $("#p-title").textContent = c.title;
-    $("#mini-artist").textContent = $("#p-artist").textContent = c.artist || "";
+    if (c.videoId !== npVid) showTrack(c);
     paused = s.paused;
     syncProgress(s);
     npVid = c.videoId;
@@ -846,6 +855,14 @@ function applyStatus(s) {
   }
 }
 
+function showTrack(c) {
+  $("#mini-img").src = big(c.thumb, 120);
+  $("#p-img").src = big(c.thumb);
+  $("#p-bg").style.backgroundImage = c.thumb ? `url('${big(c.thumb, 120).replace(/'/g, "%27")}')` : "none";
+  $("#mini-title").textContent = $("#p-title").textContent = c.title;
+  $("#mini-artist").textContent = $("#p-artist").textContent = c.artist || "";
+}
+
 function setBusy(on) { busy = on; $("#ctrls").classList.toggle("busy", on); updatePlayButton(); }
 async function action(path, body, changesTrack) {
   if (busy) return;
@@ -855,15 +872,30 @@ async function action(path, body, changesTrack) {
   if (changesTrack) loadingTrack = true;
   setBusy(false);
   if (s) applyStatus(s);
-  if (changesTrack) { loadingTrack = true; updatePlayButton(); }
+  if (changesTrack) { loadingTrack = true; updatePlayButton(); kickPoll(); }
 }
+// Start a track (row tap / Play / Shuffle): show it right away, as loading.
+let pending = null, pendingUntil = 0;
 function play(path, body) {
-  loadingTrack = true; playing = true; document.body.classList.add("has-mini"); updatePlayButton();
-  post(path, body).then(s => { applyStatus(s); loadingTrack = true; updatePlayButton(); }).catch(() => {});
+  const t = path === "play" ? body : (!body.shuffle && body.tracks && body.tracks[0]) || null;
+  pending = t; pendingUntil = performance.now() + 20000;
+  loadingTrack = true; playing = true; document.body.classList.add("has-mini");
+  if (t) {
+    showTrack(t);
+    npVid = t.videoId; npDur = t.duration || 0;
+    $("#t-dur").textContent = npDur ? fmt(npDur) : "–:––";
+    $("#t-cur").textContent = "0:00";
+    $("#p-fill").style.width = $("#mini-fill").style.width = "0%";
+    markPlaying();
+  }
+  updatePlayButton();
+  post(path, body).then(s => { applyStatus(s); kickPoll(); }).catch(() => { pending = null; });
 }
+let pollT;
+function kickPoll(ms = 250) { clearTimeout(pollT); pollT = setTimeout(poll, ms); }
 async function poll() {
   try { applyStatus(await api("status")); } catch (e) {}
-  setTimeout(poll, loadingTrack ? 350 : (document.hidden ? 8000 : 2000));
+  pollT = setTimeout(poll, loadingTrack ? 350 : (document.hidden ? 8000 : 2000));
 }
 
 // ---------------------------------------------------------------- account ---

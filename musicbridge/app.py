@@ -550,6 +550,10 @@ class Engine:
     shuffle: bool = False
     repeat: str = "off"                              # "off" | "all" | "one"
     loading: bool = False                            # track picked but no audio yet
+    # Bumped on every explicit "start playing" (play a track/list, resume) — not
+    # when the queue advances by itself. The TV app opens its Now Playing screen
+    # when this changes, so dismissing it sticks until you start something new.
+    play_seq: int = 0
     _ytdlp: Optional[subprocess.Popen] = None
     _ffmpeg: Optional[subprocess.Popen] = None
     _stop: bool = False
@@ -569,6 +573,7 @@ class Engine:
 
     def play_now(self, track: dict):
         with self._wake:
+            self.play_seq += 1
             self.queue.insert(0, track)
             self._interrupt()
             self._wake.notify()
@@ -590,6 +595,7 @@ class Engine:
                 random.shuffle(tracks)
             self.queue = tracks
             self.history = []
+            self.play_seq += 1
             self._interrupt()
             self._wake.notify()
 
@@ -619,6 +625,7 @@ class Engine:
             if self.current and self.paused:
                 self._signal_procs(signal.SIGCONT)
                 self.paused = False
+                self.play_seq += 1
                 self._paused_accum += time.monotonic() - self._paused_at
 
     def stop(self):
@@ -668,6 +675,7 @@ class Engine:
                 "repeat": self.repeat,
                 "loading": self.loading,
                 "elapsed": round(self._elapsed(), 1),
+                "play_seq": self.play_seq,
             }
 
     # -- internals ---------------------------------------------------------- #

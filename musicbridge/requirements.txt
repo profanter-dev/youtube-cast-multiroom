@@ -3,3 +3,8 @@ waitress>=3.0
 ytmusicapi>=1.8
 requests>=2.31
 yt-dlp>=2025.1.1
+# YouTube Music's own client (needed for your uploads) requires solving YouTube's
+# JS challenges (official solver scripts, run with deno) and a PO token, fetched
+# from the bgutil-provider container through this yt-dlp plugin.
+yt-dlp-ejs
+bgutil-ytdlp-pot-provider

@@ -33,6 +33,7 @@ YouTube Music app's Cast button. That's unavoidable — YouTube Music exposes no
 |---|---|
 | `musicbridge` | Web remote + player. Searches your YTM account, streams audio into the Snapcast FIFO. |
 | `snapserver`  | Reads the FIFO and streams in sync to every Snapcast client. |
+| `bgutil-provider` | Generates YouTube "PO tokens" for YouTube Music's own client — needed only for tracks you **uploaded** to YouTube Music. Private network, no ports. |
 
 ## Prerequisites
 
@@ -267,5 +268,11 @@ and `YTDLP_USE_COOKIES` (default `0`).
 - **Playback breaks after a YouTube change** — rebuild musicbridge on your dev
   machine to pull the latest yt-dlp, push it (see *Publishing images to GHCR*), then
   `docker compose pull musicbridge && docker compose up -d musicbridge` on the host.
+- **A song you uploaded to YouTube Music doesn't play** — uploads are private
+  videos that only YouTube Music's own client (logged in) may stream; youtube.com
+  says "Video unavailable". musicbridge retries such tracks as YouTube Music with
+  your cookie and a PO token from the `bgutil-provider` container (log line
+  `[YouTube Music client]`). Make sure that container runs and shares the
+  `multiroom` network with musicbridge.
 - **Volume panel says "snapserver unreachable"** — set `SNAPSERVER_CONTROL` to your
   snapserver's `host:port` if it isn't the default `snapserver:1705`.

@@ -12,19 +12,38 @@ services:
       - COOKIE_REFRESH_AT=${COOKIE_REFRESH_AT:-04:00}
       # Optional: alert (e.g. a Home Assistant webhook) when the cookie dies.
       - NOTIFY_WEBHOOK_URL=${NOTIFY_WEBHOOK_URL:-}
+      # PO-token provider for YouTube Music's own client (used for your uploads).
+      - POT_PROVIDER_URL=http://bgutil-provider:4416
     volumes:
       - ${DATA_DIR}/snapfifo:/snapfifo
       - ${DATA_DIR}/musicbridge:/data
+    depends_on:
+      - bgutil-provider
     networks:
       - traefik
+      - multiroom
     labels:
       - traefik.enable=true
+      # musicbridge is on two networks: tell Traefik which one to route through.
+      - traefik.docker.network=traefik
       - "traefik.http.routers.music.rule=Host(`${MUSIC_HOST}`)"
       - traefik.http.routers.music.entrypoints=websecure
       - traefik.http.routers.music.tls=true
       - traefik.http.routers.music.tls.certresolver=letsencrypt
       - traefik.http.routers.music.service=music
       - traefik.http.services.music.loadbalancer.server.port=8080
+
+  # Generates YouTube "PO tokens" so yt-dlp can use YouTube Music's own client,
+  # the only one that can stream tracks you uploaded to YouTube Music. The server
+  # is unauthenticated: no published ports, and only on the private network
+  # shared with musicbridge.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    init: true
+    networks:
+      - multiroom
 
   snapserver:
     image: ghcr.io/profanter-dev/youtube-cast-multiroom-snapserver:latest
@@ -55,3 +74,5 @@ services:
 networks:
   traefik:
     external: true
+  # Private: musicbridge <-> bgutil-provider only.
+  multiroom: {}

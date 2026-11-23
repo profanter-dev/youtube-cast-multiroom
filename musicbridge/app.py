@@ -65,6 +65,10 @@ YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "")
 # the cookie to yt-dlp (it's still used for the ytmusicapi account side). Flip to
 # 1 only if extraction starts failing with "confirm you're not a bot".
 YTDLP_USE_COOKIES = os.environ.get("YTDLP_USE_COOKIES", "0") == "1"
+# Tracks you uploaded to YouTube Music only play through YouTube Music's own
+# client (web_music, logged in) — youtube.com answers "Video unavailable" — and
+# that client needs a PO token, which the bgutil-provider container generates.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 
 # Cookie keeper (see the "Cookie keeper" section below).
 # When the nightly check + refresh runs, in the container's local time (set TZ).
@@ -642,6 +646,7 @@ class Engine:
     _started: float = 0.0                            # monotonic start of current track
     _paused_at: float = 0.0                          # monotonic time pause began
     _paused_accum: float = 0.0                       # total paused seconds this track
+    _got_audio: bool = False                         # this attempt produced audio
 
     def __post_init__(self):
         self._lock = threading.RLock()
@@ -829,18 +834,44 @@ class Engine:
                 self._natural_end = not (self._skipped or self._stop)
 
     def _play_blocking(self, track: dict):
+        got_audio = self._attempt(track, with_cookies=YTDLP_USE_COOKIES)
+        # Your own uploads (and other private/age-gated videos) only open with
+        # your login; the cookie-free path can't fetch them. Retry those once with
+        # the cookie — but only then, since a logged-in session pushes normal
+        # songs onto streams yt-dlp can't download.
+        if (not got_audio and not self._skipped and not self._stop
+                and os.path.exists(COOKIES_FILE)):
+            print("[player] ↻ no audio — retrying as YouTube Music, logged in "
+                  "(needed for your uploads)", flush=True)
+            self.loading = True
+            self._attempt(track, with_cookies=True, music_client=True)
+
+    def _attempt(self, track: dict, with_cookies: bool,
+                 music_client: bool = False) -> bool:
+        """One yt-dlp -> ffmpeg -> FIFO run. Returns whether audio came out.
+
+        music_client: ask as YouTube Music (music.youtube.com + web_music client,
+        PO token from POT_PROVIDER_URL) — the only way to get your uploads."""
+        self._got_audio = False
         video_id = track["videoId"]
-        # www.youtube.com extracts more reliably than music.youtube.com here.
-        url = f"https://www.youtube.com/watch?v={video_id}"
         ytdlp_cmd = ["yt-dlp", "-f", YTDLP_FORMAT, "-o", "-",
                      "--quiet", "--no-warnings", "--no-progress"]
-        if YTDLP_PLAYER_CLIENT:
-            ytdlp_cmd += ["--extractor-args",
-                          f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
+        if music_client:
+            url = f"https://music.youtube.com/watch?v={video_id}"
+            ytdlp_cmd += ["--extractor-args", "youtube:player_client=web_music"]
+            if POT_PROVIDER_URL:
+                ytdlp_cmd += ["--extractor-args",
+                              f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
+        else:
+            # www.youtube.com extracts more reliably than music.youtube.com here.
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            if YTDLP_PLAYER_CLIENT:
+                ytdlp_cmd += ["--extractor-args",
+                              f"youtube:player_client={YTDLP_PLAYER_CLIENT}"]
         # yt-dlp rewrites its --cookies file on exit. Give it a private copy (so it
         # can't race the cookie keeper or an upload) and merge back what it got.
         jar_copy = None
-        if YTDLP_USE_COOKIES and os.path.exists(COOKIES_FILE):
+        if with_cookies and os.path.exists(COOKIES_FILE):
             fd, jar_copy = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
             os.close(fd)
             with _cookie_lock:
@@ -849,7 +880,9 @@ class Engine:
         ytdlp_cmd.append(url)
 
         started = time.monotonic()
-        print(f"[player] ▶ {track.get('title', video_id)} ({video_id})", flush=True)
+        print(f"[player] ▶ {track.get('title', video_id)} ({video_id})"
+              f"{' [with cookie]' if jar_copy else ''}"
+              f"{' [YouTube Music client]' if music_client else ''}", flush=True)
         try:
             # stderr is inherited (not silenced) so yt-dlp/ffmpeg errors land in
             # `docker compose logs musicbridge`.
@@ -873,11 +906,14 @@ class Engine:
             elapsed = time.monotonic() - started
             print(f"[player] ■ ended after {elapsed:.1f}s "
                   f"(ffmpeg={ff_rc}, yt-dlp={yt_rc})", flush=True)
-            if elapsed < 2 and not self._skipped:
-                print("[player] ⚠ ended almost instantly — yt-dlp could not get "
-                      "the stream (see its error above). If YouTube asks to "
-                      "'confirm you're not a bot', drop a Netscape cookies.txt at "
-                      f"{COOKIES_FILE}.", flush=True)
+            if not self._got_audio and not self._skipped:
+                if jar_copy:
+                    print("[player] ⚠ no audio even with the cookie — yt-dlp could "
+                          "not get the stream (see its error above).", flush=True)
+                elif not os.path.exists(COOKIES_FILE):
+                    print("[player] ⚠ no audio — yt-dlp could not get the stream "
+                          "(see its error above). Private videos and your own "
+                          "uploads need a cookie: upload one via Account.", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the worker die
             print(f"[player] error: {exc}", flush=True)
         finally:
@@ -892,6 +928,7 @@ class Engine:
             self._ytdlp = self._ffmpeg = None
             if jar_copy:
                 _merge_back_ytdlp_jar(jar_copy)
+        return self._got_audio
 
     def _watch_progress(self, proc):
         """Clear `loading` once ffmpeg reports it's actually producing audio,
@@ -908,6 +945,7 @@ class Engine:
                         val = raw.split(b"=", 1)[1].strip()
                         if val.isdigit() and int(val.decode()) > 0:
                             self.loading = False
+                            self._got_audio = True
                             cleared = True
                 except Exception:  # noqa: BLE001
                     pass
@@ -1241,6 +1279,9 @@ if __name__ == "__main__":
     print(f"[cookie] keeper: check + refresh at startup and daily at "
           f"{COOKIE_REFRESH_AT} ({time.strftime('%Z')}); alerts "
           f"{'→ webhook' if NOTIFY_WEBHOOK_URL else 'off (NOTIFY_WEBHOOK_URL unset)'}",
+          flush=True)
+    print(f"[ytdlp] uploads/private tracks: retried via YouTube Music's client, "
+          f"PO tokens from {POT_PROVIDER_URL or 'nowhere (POT_PROVIDER_URL unset)'}",
           flush=True)
     threading.Thread(target=_cookie_keeper, daemon=True).start()
     print(f"[musicbridge] serving on :{PORT}, FIFO={SNAPFIFO}")
